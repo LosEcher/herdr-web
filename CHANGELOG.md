@@ -9,6 +9,9 @@
 - Added browser desktop notifications for agent attention states. Enable under Settings → Features;
   optional per-status toggles cover blocked and done, notifications deep-link to the pane on click,
   and an optional tab-title badge shows the count of agents needing attention.
+- Added optional Web Push + service worker support so blocked/done alerts can reach the device when
+  the tab is closed. The bridge auto-generates VAPID keys (or accepts `HERDR_WEB_VAPID_*`), exposes
+  `web_push` on `/api/capabilities`, and accepts `/api/push/subscribe|unsubscribe`.
 - Added `scripts/dev.sh` / `npm run dev` to run the bridge and Vite HMR frontend together for local
   iteration (proxied `/api` and `/ws`, hot-reloading UI without rebuilding `web/dist` each change).
   [PR #51](https://github.com/kcosr/herdr-web/pull/51)

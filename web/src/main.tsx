@@ -23,8 +23,15 @@ window.__HERDR_WEB__ = {
     "ime-caret-anchor",
     "focus-textarea-for-ime",
     "ime-preedit-overlay",
+    "browser-notifications",
+    "web-push",
   ],
 };
+
+// Register the push-capable service worker early (no-op off secure contexts).
+if (typeof navigator !== "undefined" && "serviceWorker" in navigator) {
+  void navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(() => undefined);
+}
 
 const root = document.getElementById("root");
 
