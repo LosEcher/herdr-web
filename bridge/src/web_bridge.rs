@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -79,6 +79,8 @@ const TERMINAL_OUTPUT_COALESCE_MAX_CHUNKS: usize = 256;
 const DAEMON_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTIVITY_WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const ACTIVITY_WATCHER_MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Short TTL so bursty notes/pins/list handlers share one Herdr `pane.list` round-trip.
+const PANE_LIST_CACHE_TTL: Duration = Duration::from_millis(300);
 const ACTIVITY_RESUBSCRIBE_DEBOUNCE: Duration = Duration::from_millis(100);
 const ACTIVITY_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const MANAGED_AGENT_SHELL_SETTLE_DELAY: Duration = Duration::from_millis(100);
@@ -115,7 +117,16 @@ struct BridgeState {
     runtime: tokio::runtime::Handle,
     ui_event_tx: tokio::sync::broadcast::Sender<String>,
     activity_tx: tokio::sync::broadcast::Sender<ActivityMessage>,
+    /// Latest `pane.agent_status_changed` per pane_id for lag recovery without full resync.
+    activity_latest: Arc<Mutex<HashMap<String, ActivityMessage>>>,
+    pane_list_cache: Arc<Mutex<PaneListCache>>,
     upload_dir: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct PaneListCache {
+    panes: Option<Vec<PaneInfo>>,
+    fetched_at: Option<StdInstant>,
 }
 
 #[derive(Debug, Clone)]
@@ -976,6 +987,8 @@ async fn run_server(options: BridgeOptions) -> io::Result<()> {
         runtime: tokio::runtime::Handle::current(),
         ui_event_tx: tokio::sync::broadcast::channel(256).0,
         activity_tx: tokio::sync::broadcast::channel(512).0,
+        activity_latest: Arc::new(Mutex::new(HashMap::new())),
+        pane_list_cache: Arc::new(Mutex::new(PaneListCache::default())),
         upload_dir: options.upload_dir.clone(),
     };
     spawn_agent_activity_watcher(state.clone());
@@ -2968,7 +2981,7 @@ async fn agent_activity_list_handler(
     ensure_allowed_request(&headers, &state.request_policy)?;
     let list_state = state.clone();
     let response = tokio::task::spawn_blocking(move || {
-        let panes = current_panes(&list_state.api)?;
+        let panes = cached_current_panes(&list_state)?;
         observe_agent_activity_snapshot(&list_state, &panes);
         Ok::<_, BridgeError>(list_state.agent_activity.list(&panes))
     })
@@ -2984,7 +2997,7 @@ async fn agent_pins_list_handler(
     ensure_allowed_request(&headers, &state.request_policy)?;
     Ok(Json(
         run_store_task(state, move |state| {
-            let panes = current_panes(&state.api)?;
+            let panes = cached_current_panes(&state)?;
             Ok(state.agent_pins.list(&panes)?)
         })
         .await?,
@@ -2999,7 +3012,7 @@ async fn agent_pins_pin_handler(
     ensure_allowed_request(&headers, &state.request_policy)?;
     let event_pane_id = pane_id.clone();
     let response = run_store_task(state.clone(), move |state| {
-        let panes = current_panes(&state.api)?;
+        let panes = cached_current_panes(&state)?;
         Ok(state.agent_pins.pin(&pane_id, &panes)?)
     })
     .await?;
@@ -3015,7 +3028,7 @@ async fn agent_pins_unpin_handler(
     ensure_allowed_request(&headers, &state.request_policy)?;
     let event_pane_id = pane_id.clone();
     let response = run_store_task(state.clone(), move |state| {
-        let panes = current_panes(&state.api)?;
+        let panes = cached_current_panes(&state)?;
         Ok(state.agent_pins.unpin(&pane_id, &panes)?)
     })
     .await?;
@@ -3031,7 +3044,7 @@ async fn notes_list_handler(
     ensure_allowed_request(&headers, &state.request_policy)?;
     Ok(Json(
         run_store_task(state, move |state| {
-            let panes = current_panes(&state.api)?;
+            let panes = cached_current_panes(&state)?;
             Ok(state.notes.list(query, &panes)?)
         })
         .await?,
@@ -3045,7 +3058,7 @@ async fn notes_create_handler(
 ) -> Result<Json<NoteResponse>, BridgeError> {
     ensure_allowed_request(&headers, &state.request_policy)?;
     let note = run_store_task(state.clone(), move |state| {
-        let panes = current_panes(&state.api)?;
+        let panes = cached_current_panes(&state)?;
         Ok(state.notes.create(body, &panes)?)
     })
     .await?;
@@ -3061,7 +3074,7 @@ async fn notes_update_handler(
 ) -> Result<Json<NoteResponse>, BridgeError> {
     ensure_allowed_request(&headers, &state.request_policy)?;
     let note = run_store_task(state.clone(), move |state| {
-        let panes = current_panes(&state.api)?;
+        let panes = cached_current_panes(&state)?;
         Ok(state.notes.update(&note_id, body, &panes)?)
     })
     .await?;
@@ -3077,7 +3090,7 @@ async fn notes_attach_handler(
 ) -> Result<Json<NoteResponse>, BridgeError> {
     ensure_allowed_request(&headers, &state.request_policy)?;
     let note = run_store_task(state.clone(), move |state| {
-        let panes = current_panes(&state.api)?;
+        let panes = cached_current_panes(&state)?;
         Ok(state.notes.attach(&note_id, body, &panes)?)
     })
     .await?;
@@ -3093,7 +3106,7 @@ async fn notes_detach_handler(
 ) -> Result<Json<NoteResponse>, BridgeError> {
     ensure_allowed_request(&headers, &state.request_policy)?;
     let note = run_store_task(state.clone(), move |state| {
-        let panes = current_panes(&state.api)?;
+        let panes = cached_current_panes(&state)?;
         Ok(state.notes.detach(&note_id, body, &panes)?)
     })
     .await?;
@@ -3109,7 +3122,7 @@ async fn notes_archive_handler(
 ) -> Result<Json<NoteResponse>, BridgeError> {
     ensure_allowed_request(&headers, &state.request_policy)?;
     let note = run_store_task(state.clone(), move |state| {
-        let panes = current_panes(&state.api)?;
+        let panes = cached_current_panes(&state)?;
         Ok(state.notes.archive(&note_id, body, &panes)?)
     })
     .await?;
@@ -3125,7 +3138,7 @@ async fn notes_restore_handler(
 ) -> Result<Json<NoteResponse>, BridgeError> {
     ensure_allowed_request(&headers, &state.request_policy)?;
     let note = run_store_task(state.clone(), move |state| {
-        let panes = current_panes(&state.api)?;
+        let panes = cached_current_panes(&state)?;
         Ok(state.notes.restore(&note_id, body, &panes)?)
     })
     .await?;
@@ -3141,7 +3154,7 @@ async fn notes_delete_handler(
 ) -> Result<Json<NoteResponse>, BridgeError> {
     ensure_allowed_request(&headers, &state.request_policy)?;
     let note = run_store_task(state.clone(), move |state| {
-        let panes = current_panes(&state.api)?;
+        let panes = cached_current_panes(&state)?;
         Ok(state.notes.delete(&note_id, body, &panes)?)
     })
     .await?;
@@ -3190,6 +3203,7 @@ fn broadcast_notes_changed(state: &BridgeState, note_id: Option<&str>, revision:
 }
 
 fn observe_agent_activity_snapshot(state: &BridgeState, panes: &[PaneInfo]) {
+    prune_activity_latest(state, panes);
     if state.agent_activity.observe_snapshot(panes) {
         broadcast_agent_activity_changed(state);
     }
@@ -3206,6 +3220,127 @@ fn current_panes(api: &ApiClient) -> Result<Vec<PaneInfo>, BridgeError> {
             "unexpected response: {other:?}"
         ))),
     }
+}
+
+/// Shared short-lived pane list for store handlers that only need a consistent open-pane set.
+fn cached_current_panes(state: &BridgeState) -> Result<Vec<PaneInfo>, BridgeError> {
+    if let Ok(cache) = state.pane_list_cache.lock() {
+        if let (Some(panes), Some(fetched_at)) = (&cache.panes, cache.fetched_at) {
+            if fetched_at.elapsed() < PANE_LIST_CACHE_TTL {
+                return Ok(panes.clone());
+            }
+        }
+    }
+    let panes = current_panes(&state.api)?;
+    store_pane_list_cache(state, &panes);
+    Ok(panes)
+}
+
+fn store_pane_list_cache(state: &BridgeState, panes: &[PaneInfo]) {
+    if let Ok(mut cache) = state.pane_list_cache.lock() {
+        cache.panes = Some(panes.to_vec());
+        cache.fetched_at = Some(StdInstant::now());
+    }
+}
+
+fn invalidate_pane_list_cache(state: &BridgeState) {
+    if let Ok(mut cache) = state.pane_list_cache.lock() {
+        cache.panes = None;
+        cache.fetched_at = None;
+    }
+}
+
+fn remember_activity_message(
+    latest: &Mutex<HashMap<String, ActivityMessage>>,
+    message: &ActivityMessage,
+) {
+    if let ActivityMessage::PaneAgentStatusChanged { pane_id, .. } = message {
+        if let Ok(mut guard) = latest.lock() {
+            guard.insert(pane_id.clone(), message.clone());
+        }
+    }
+}
+
+fn publish_activity_message(state: &BridgeState, message: ActivityMessage) {
+    remember_activity_message(&state.activity_latest, &message);
+    let _ = state.activity_tx.send(message);
+}
+
+fn prune_activity_latest(state: &BridgeState, panes: &[PaneInfo]) {
+    let live = panes
+        .iter()
+        .map(|pane| pane.pane_id.as_str())
+        .collect::<HashSet<_>>();
+    if let Ok(mut guard) = state.activity_latest.lock() {
+        guard.retain(|pane_id, _| live.contains(pane_id.as_str()));
+    }
+}
+
+fn activity_latest_snapshot(state: &BridgeState) -> Vec<ActivityMessage> {
+    let Ok(guard) = state.activity_latest.lock() else {
+        return Vec::new();
+    };
+    let mut messages = guard.values().cloned().collect::<Vec<_>>();
+    messages.sort_by(|left, right| {
+        activity_message_pane_id(left).cmp(&activity_message_pane_id(right))
+    });
+    messages
+}
+
+fn activity_message_pane_id(message: &ActivityMessage) -> Option<&str> {
+    match message {
+        ActivityMessage::PaneAgentStatusChanged { pane_id, .. } => Some(pane_id.as_str()),
+        ActivityMessage::ResyncRequired { .. } => None,
+    }
+}
+
+/// Drain the activity receiver after a lag, keeping the latest status per pane_id.
+fn drain_activity_receiver_latest(
+    activity_rx: &mut tokio::sync::broadcast::Receiver<ActivityMessage>,
+) -> Result<HashMap<String, ActivityMessage>, ()> {
+    let mut coalesced = HashMap::new();
+    loop {
+        match activity_rx.try_recv() {
+            Ok(message) => {
+                if let ActivityMessage::PaneAgentStatusChanged { pane_id, .. } = &message {
+                    coalesced.insert(pane_id.clone(), message);
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return Err(()),
+        }
+    }
+    Ok(coalesced)
+}
+
+fn merge_activity_latest(
+    authority: Vec<ActivityMessage>,
+    drained: HashMap<String, ActivityMessage>,
+) -> Vec<ActivityMessage> {
+    if authority.is_empty() {
+        let mut messages = drained.into_values().collect::<Vec<_>>();
+        messages.sort_by(|left, right| {
+            activity_message_pane_id(left).cmp(&activity_message_pane_id(right))
+        });
+        return messages;
+    }
+    // Side-cache is updated on every publish, so it is authoritative for skipped frames.
+    // Fold any drained messages that arrived after lag notification on top.
+    let mut by_pane = HashMap::new();
+    for message in authority {
+        if let Some(pane_id) = activity_message_pane_id(&message) {
+            by_pane.insert(pane_id.to_string(), message);
+        }
+    }
+    for (pane_id, message) in drained {
+        by_pane.insert(pane_id, message);
+    }
+    let mut messages = by_pane.into_values().collect::<Vec<_>>();
+    messages.sort_by(|left, right| {
+        activity_message_pane_id(left).cmp(&activity_message_pane_id(right))
+    });
+    messages
 }
 
 fn shared_selected_pane(
@@ -3341,12 +3476,31 @@ async fn handle_activity_socket(socket: WebSocket, state: BridgeState) {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let event = ActivityMessage::ResyncRequired {
-                            reason: "activity receiver lagged".to_string(),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Prefer latest-per-pane replay over resync_required + full snapshot.
+                        warn!(
+                            skipped,
+                            "activity receiver lagged; replaying latest-per-pane statuses"
+                        );
+                        let drained = match drain_activity_receiver_latest(&mut activity_rx) {
+                            Ok(map) => map,
+                            Err(()) => break,
                         };
-                        let _ = send_activity_message(&mut ws_sender, &event).await;
-                        break;
+                        let replay =
+                            merge_activity_latest(activity_latest_snapshot(&state), drained);
+                        let mut send_failed = false;
+                        for message in replay {
+                            if send_activity_message(&mut ws_sender, &message)
+                                .await
+                                .is_err()
+                            {
+                                send_failed = true;
+                                break;
+                            }
+                        }
+                        if send_failed {
+                            break;
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -3976,7 +4130,9 @@ fn run_agent_activity_subscription(
     resubscribe_rx: &mpsc::Receiver<()>,
 ) -> Result<(), BridgeError> {
     drain_resubscribe_signals(resubscribe_rx);
+    invalidate_pane_list_cache(state);
     let panes = current_panes(&state.api)?;
+    store_pane_list_cache(state, &panes);
     observe_agent_activity_snapshot(state, &panes);
     let pane_ids = sorted_pane_ids(&panes);
     if pane_ids.is_empty() {
@@ -4001,7 +4157,9 @@ fn run_agent_activity_subscription(
 
     loop {
         if drain_resubscribe_signals(resubscribe_rx) {
+            invalidate_pane_list_cache(state);
             let next_panes = current_panes(&state.api)?;
+            store_pane_list_cache(state, &next_panes);
             observe_agent_activity_snapshot(state, &next_panes);
             if !activity_resubscribe_needed(&pane_ids, &next_panes) {
                 continue;
@@ -4039,7 +4197,7 @@ fn run_agent_activity_subscription(
                             },
                         );
                     }
-                    let _ = state.activity_tx.send(message);
+                    publish_activity_message(state, message);
                 }
             }
             Ok(None) => {
@@ -6561,6 +6719,84 @@ mod tests {
         let parent = PathBuf::from("/tmp/herdr-web/uploads");
         assert!(is_direct_child(&parent, &parent.join("file.png")));
         assert!(!is_direct_child(&parent, &parent.join("nested/file.png")));
+    }
+
+    #[test]
+    fn merge_activity_latest_prefers_authority_then_drained() {
+        let authority = vec![
+            ActivityMessage::PaneAgentStatusChanged {
+                pane_id: "pane-a".to_string(),
+                workspace_id: "ws".to_string(),
+                agent_status: AgentStatus::Working,
+                agent: None,
+                title: Some("old".to_string()),
+                display_agent: None,
+                state_labels: HashMap::new(),
+            },
+            ActivityMessage::PaneAgentStatusChanged {
+                pane_id: "pane-b".to_string(),
+                workspace_id: "ws".to_string(),
+                agent_status: AgentStatus::Blocked,
+                agent: None,
+                title: None,
+                display_agent: None,
+                state_labels: HashMap::new(),
+            },
+        ];
+        let mut drained = HashMap::new();
+        drained.insert(
+            "pane-a".to_string(),
+            ActivityMessage::PaneAgentStatusChanged {
+                pane_id: "pane-a".to_string(),
+                workspace_id: "ws".to_string(),
+                agent_status: AgentStatus::Done,
+                agent: None,
+                title: Some("new".to_string()),
+                display_agent: None,
+                state_labels: HashMap::new(),
+            },
+        );
+        let merged = merge_activity_latest(authority, drained);
+        assert_eq!(merged.len(), 2);
+        match &merged[0] {
+            ActivityMessage::PaneAgentStatusChanged {
+                pane_id,
+                agent_status,
+                title,
+                ..
+            } => {
+                assert_eq!(pane_id, "pane-a");
+                assert_eq!(*agent_status, AgentStatus::Done);
+                assert_eq!(title.as_deref(), Some("new"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &merged[1] {
+            ActivityMessage::PaneAgentStatusChanged { pane_id, .. } => {
+                assert_eq!(pane_id, "pane-b");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_activity_latest_falls_back_to_drained_when_authority_empty() {
+        let mut drained = HashMap::new();
+        drained.insert(
+            "pane-z".to_string(),
+            ActivityMessage::PaneAgentStatusChanged {
+                pane_id: "pane-z".to_string(),
+                workspace_id: "ws".to_string(),
+                agent_status: AgentStatus::Idle,
+                agent: None,
+                title: None,
+                display_agent: None,
+                state_labels: HashMap::new(),
+            },
+        );
+        let merged = merge_activity_latest(Vec::new(), drained);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(activity_message_pane_id(&merged[0]), Some("pane-z"));
     }
 
     fn origin_headers(host: &str, origin: Option<&str>) -> HeaderMap {

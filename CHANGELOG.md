@@ -18,6 +18,12 @@
 
 ### Changed
 
+- Activity WebSocket lag recovery now replays the latest agent status per pane instead of closing
+  the socket and forcing a full snapshot resync, reducing refresh storms when a tab falls behind.
+- Bridge store handlers (notes, pins, agent-activity list) share a short-lived pane-list cache
+  (~300ms) so bursty API traffic does not re-query Herdr `pane.list` on every request.
+- Browser activity patches only rewrite the affected pane, workspace, and tab objects so unrelated
+  sidebar entries keep stable identities.
 - Static responses now set cache headers: HTML entrypoints use `Cache-Control: no-cache`, while
   hashed `/assets/*` files are long-cached as immutable to make production static refreshes more
   predictable after rebuilds.

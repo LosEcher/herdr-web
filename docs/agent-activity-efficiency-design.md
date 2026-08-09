@@ -87,16 +87,16 @@ Nullable presentation fields are serialized explicitly as `null` when absent, an
 always an object. That keeps browser patching simple: the message replaces the pane's current agent
 presentation state instead of merging sparse partial fields.
 
-If a browser activity receiver lags behind the bridge broadcast channel, the bridge sends:
+If a browser activity receiver lags behind the bridge broadcast channel, the bridge **does not**
+force a full snapshot resync by default. It keeps a side-cache of the latest
+`pane.agent_status_changed` message per `pane_id`. On lag it:
 
-```json
-{
-  "type": "resync_required",
-  "reason": "activity receiver lagged"
-}
-```
+1. drains any remaining messages still in the broadcast receiver (latest wins per pane)
+2. merges those with the side-cache (authoritative for skipped frames)
+3. replays the coalesced latest-per-pane set on the same socket
 
-The bridge then closes that activity socket. The browser reconnects and refreshes the full snapshot.
+`resync_required` remains available for serialization failures and for the browser when a delta
+references an unknown pane or mismatched workspace (structural staleness).
 
 ```mermaid
 sequenceDiagram
@@ -119,9 +119,8 @@ sequenceDiagram
   end
 
   alt browser receiver lags
-    Bus->>WS: resync_required
-    WS-->>UI: close socket
-    UI->>UI: reconnect and refresh full snapshot
+    Bus->>WS: latest-per-pane replay from side-cache
+    WS->>UI: apply coalesced deltas (no forced reconnect)
   end
 ```
 

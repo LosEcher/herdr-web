@@ -172,6 +172,82 @@ describe("applyActivityMessage", () => {
       "resync",
     );
   });
+
+  it("only rewrites the affected workspace/tab objects", () => {
+    const data: Snapshot = {
+      workspaces: [
+        {
+          workspace_id: "workspace-1",
+          number: 1,
+          label: "one",
+          focused: true,
+          pane_count: 1,
+          tab_count: 1,
+          active_tab_id: "tab-1",
+          agent_status: "idle",
+        },
+        {
+          workspace_id: "workspace-2",
+          number: 2,
+          label: "two",
+          focused: false,
+          pane_count: 1,
+          tab_count: 1,
+          active_tab_id: "tab-2",
+          agent_status: "idle",
+        },
+      ],
+      tabs: [
+        {
+          tab_id: "tab-1",
+          workspace_id: "workspace-1",
+          number: 1,
+          label: "main",
+          focused: true,
+          pane_count: 1,
+          agent_status: "idle",
+        },
+        {
+          tab_id: "tab-2",
+          workspace_id: "workspace-2",
+          number: 1,
+          label: "other",
+          focused: false,
+          pane_count: 1,
+          agent_status: "idle",
+        },
+      ],
+      panes: [
+        pane("pane-1", "tab-1", "idle"),
+        {
+          ...pane("pane-2", "tab-2", "idle"),
+          workspace_id: "workspace-2",
+        },
+      ],
+      layouts: [],
+    };
+    const untouchedWorkspace = data.workspaces[1];
+    const untouchedTab = data.tabs[1];
+    const untouchedPane = data.panes[1];
+
+    const result = applyActivityMessage(data, {
+      type: "pane.agent_status_changed",
+      pane_id: "pane-1",
+      workspace_id: "workspace-1",
+      agent_status: "blocked",
+      agent: null,
+      title: null,
+      display_agent: null,
+      state_labels: {},
+    });
+
+    expect(result.status).toBe("applied");
+    expect(result.snapshot?.workspaces[0].agent_status).toBe("blocked");
+    expect(result.snapshot?.tabs[0].agent_status).toBe("blocked");
+    expect(result.snapshot?.workspaces[1]).toBe(untouchedWorkspace);
+    expect(result.snapshot?.tabs[1]).toBe(untouchedTab);
+    expect(result.snapshot?.panes[1]).toBe(untouchedPane);
+  });
 });
 
 describe("replayActivityMessages", () => {

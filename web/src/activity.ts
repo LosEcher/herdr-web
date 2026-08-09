@@ -109,37 +109,47 @@ function applyPaneAgentStatusChanged(
   if (currentPane.workspace_id !== message.workspace_id) {
     return { status: "resync", snapshot };
   }
-  const panes = snapshot.panes.map((pane, index) =>
-    index === paneIndex
-      ? {
-          ...pane,
-          agent_status: message.agent_status,
-          agent: nullableToOptional(message.agent),
-          title: nullableToOptional(message.title),
-          display_agent: nullableToOptional(message.display_agent),
-          state_labels: message.state_labels,
-        }
-      : pane,
+
+  // Clone only the panes array; keep other pane object identities stable.
+  const panes = snapshot.panes.slice();
+  const patchedPane = {
+    ...currentPane,
+    agent_status: message.agent_status,
+    agent: nullableToOptional(message.agent),
+    title: nullableToOptional(message.title),
+    display_agent: nullableToOptional(message.display_agent),
+    state_labels: message.state_labels,
+  };
+  panes[paneIndex] = patchedPane;
+
+  // Recompute aggregates only for the affected workspace/tab (not the whole lists).
+  const workspaceIndex = snapshot.workspaces.findIndex(
+    (workspace) => workspace.workspace_id === patchedPane.workspace_id,
   );
-  const patchedPane = panes[paneIndex];
-  const workspaces = snapshot.workspaces.map((workspace) =>
-    workspace.workspace_id === patchedPane.workspace_id
-      ? {
-          ...workspace,
-          agent_status: aggregateStatus(
-            panes.filter((pane) => pane.workspace_id === workspace.workspace_id),
-          ),
-        }
-      : workspace,
-  );
-  const tabs = snapshot.tabs.map((tab) =>
-    tab.tab_id === patchedPane.tab_id
-      ? {
-          ...tab,
-          agent_status: aggregateStatus(panes.filter((pane) => pane.tab_id === tab.tab_id)),
-        }
-      : tab,
-  );
+  const tabIndex = snapshot.tabs.findIndex((tab) => tab.tab_id === patchedPane.tab_id);
+
+  let workspaces = snapshot.workspaces;
+  if (workspaceIndex >= 0) {
+    const workspacePanes = panes.filter(
+      (pane) => pane.workspace_id === patchedPane.workspace_id,
+    );
+    workspaces = snapshot.workspaces.slice();
+    workspaces[workspaceIndex] = {
+      ...workspaces[workspaceIndex],
+      agent_status: aggregateStatus(workspacePanes),
+    };
+  }
+
+  let tabs = snapshot.tabs;
+  if (tabIndex >= 0) {
+    const tabPanes = panes.filter((pane) => pane.tab_id === patchedPane.tab_id);
+    tabs = snapshot.tabs.slice();
+    tabs[tabIndex] = {
+      ...tabs[tabIndex],
+      agent_status: aggregateStatus(tabPanes),
+    };
+  }
+
   return {
     status: "applied",
     snapshot: {
