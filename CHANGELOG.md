@@ -9,10 +9,28 @@
 - Added browser desktop notifications for agent attention states. Enable under Settings → Features;
   optional per-status toggles cover blocked and done, notifications deep-link to the pane on click,
   and an optional tab-title badge shows the count of agents needing attention.
+- Added `scripts/dev.sh` / `npm run dev` to run the bridge and Vite HMR frontend together for local
+  iteration (proxied `/api` and `/ws`, hot-reloading UI without rebuilding `web/dist` each change).
+  [PR #51](https://github.com/kcosr/herdr-web/pull/51)
 
 ### Changed
 
+- Static responses now set cache headers: HTML entrypoints use `Cache-Control: no-cache`, while
+  hashed `/assets/*` files are long-cached as immutable to make production static refreshes more
+  predictable after rebuilds.
+  [PR #51](https://github.com/kcosr/herdr-web/pull/51)
+
 ### Fixed
+
+- Fixed CJK / IME terminal typing so intermediate composition preedit (for example pinyin) is no
+  longer streamed into the PTY. Committed text is sent only after `compositionend`, the hidden
+  ghostty textarea is anchored near the terminal caret so the OS candidate window is usable, and
+  desktop focus is routed to that textarea (ghostty's host element is not editable after
+  contenteditable is removed, so IMEs previously had nothing reliable to attach to).
+  [PR #51](https://github.com/kcosr/herdr-web/pull/51)
+- Show in-progress IME preedit (pinyin / partial CJK) as an underlined overlay at the terminal
+  caret while composing, so composition is visible before commit.
+  [PR #51](https://github.com/kcosr/herdr-web/pull/51)
 
 ### Removed
 
