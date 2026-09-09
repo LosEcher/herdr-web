@@ -10,7 +10,7 @@ This note is analysis, not a commitment to implement every item.
 
 - `web/` — React + Vite multi-host UI
 - `bridge/` — repo-owned HTTP/WebSocket adapter (`herdr-web-bridge`)
-- `vendor/herdr-compat/` — minimal private Herdr protocol/API surface (protocol `19`)
+- `vendor/herdr-compat/` — minimal private Herdr protocol/API surface (protocol `22`)
 - `android/` — Capacitor shell around bundled `web/dist`
 
 Browsers never talk to Herdr private APIs directly. The bridge owns attach, snapshot, command
@@ -58,7 +58,7 @@ bridge provider, notes store. Cohesion is decent *around* the edges; the two cen
 
 - Terminal/renderer and settings UI lack paired unit tests.
 - HTTP contract edges are sparse in the graph (dynamic fetch URLs).
-- Protocol pin to `19` is correct but makes vendor refresh a recurring cost.
+- Protocol pin to `22` is correct but makes vendor refresh a recurring cost.
 
 ## Branch Strategy (operator)
 

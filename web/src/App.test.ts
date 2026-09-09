@@ -11,6 +11,7 @@ import {
   buildVisibleTabEntries,
   buildVisibleTabWorkspaceGroups,
   canAddNoteFromPaneMenu,
+  closeCopy,
   filterCollapsedAgentPaneEntries,
   filterCollapsedTabEntries,
   mergeCreatedPaneNoteList,
@@ -50,6 +51,22 @@ import {
 import type { AgentStatus, PaneInfo, Snapshot, TabInfo, WorkspaceInfo } from "./types";
 import { notesForPane } from "./notes";
 import type { PaneNote } from "./notes";
+
+describe("close confirmation", () => {
+  it("explicitly warns that the whole linked workspace group will close", () => {
+    expect(closeCopy("space", ["feature-a", "feature-b"])).toEqual({
+      title: "Close workspace group?",
+      message: "This closes this space and all linked worktree spaces (feature-a, feature-b), including every tab and pane in the group.",
+      confirm: "Close entire group",
+    });
+  });
+
+  it("keeps ordinary space, tab and pane confirmations scoped to their target", () => {
+    expect(closeCopy("space").confirm).toBe("Close space");
+    expect(closeCopy("tab", ["unrelated"]).title).toBe("Close tab?");
+    expect(closeCopy("pane", ["unrelated"]).title).toBe("Close pane?");
+  });
+});
 
 describe("App connection guards", () => {
   it("hides snapshots from stale backend connections", () => {
@@ -259,6 +276,96 @@ describe("App multi-bridge helpers", () => {
       "bridge-a:workspace-a:1:pane-2",
       "bridge-a:workspace-a:2:pane-1",
       "bridge-b:workspace-a:2:pane-1",
+    ]);
+  });
+
+  it("sorts by attention using Herdr's band order", () => {
+    const workspaceA = workspace("workspace-a", 1);
+    const entries = [
+      entry("bridge-a", 0, workspaceA, pane("pane-1", "workspace-a", "tab-1", "unknown"), 1),
+      entry("bridge-a", 0, workspaceA, pane("pane-2", "workspace-a", "tab-1", "idle"), 1),
+      entry("bridge-a", 0, workspaceA, pane("pane-3", "workspace-a", "tab-1", "working"), 1),
+      entry("bridge-a", 0, workspaceA, pane("pane-4", "workspace-a", "tab-1", "done"), 1),
+      entry("bridge-a", 0, workspaceA, pane("pane-5", "workspace-a", "tab-1", "blocked"), 1),
+    ];
+
+    expect(
+      sortScopedAgentPanes(entries, "attention").map((item) => item.pane.agent_status),
+    ).toEqual(["blocked", "done", "working", "idle", "unknown"]);
+  });
+
+  it("breaks attention ties by the most recent status change", () => {
+    const workspaceA = workspace("workspace-a", 1);
+    const entries = [
+      {
+        ...entry("bridge-a", 0, workspaceA, pane("pane-1", "workspace-a", "tab-1", "working"), 1),
+        lastStatusTransitionAt: 100,
+      },
+      {
+        ...entry("bridge-a", 0, workspaceA, pane("pane-2", "workspace-a", "tab-1", "working"), 1),
+        lastStatusTransitionAt: 300,
+      },
+      {
+        ...entry("bridge-a", 0, workspaceA, pane("pane-3", "workspace-a", "tab-1", "working"), 1),
+        lastStatusTransitionAt: 200,
+      },
+    ];
+
+    expect(sortScopedAgentPanes(entries, "attention").map((item) => item.pane.pane_id)).toEqual([
+      "pane-2",
+      "pane-3",
+      "pane-1",
+    ]);
+  });
+
+  it("keeps a more urgent attention band ahead of a more recent status change", () => {
+    const workspaceA = workspace("workspace-a", 1);
+    const entries = [
+      {
+        ...entry("bridge-a", 0, workspaceA, pane("pane-1", "workspace-a", "tab-1", "working"), 1),
+        lastStatusTransitionAt: 900,
+      },
+      {
+        ...entry("bridge-a", 0, workspaceA, pane("pane-2", "workspace-a", "tab-1", "blocked"), 1),
+        lastStatusTransitionAt: 100,
+      },
+    ];
+
+    expect(sortScopedAgentPanes(entries, "attention").map((item) => item.pane.pane_id)).toEqual([
+      "pane-2",
+      "pane-1",
+    ]);
+  });
+
+  it("keeps the bridge, workspace, and tab fallback when attention ties have no transitions", () => {
+    const workspaceA = workspace("workspace-a", 2);
+    const workspaceB = workspace("workspace-b", 1);
+    const entries = [
+      entry("bridge-b", 1, workspaceA, pane("pane-1", "workspace-a", "tab-1", "working"), 1),
+      entry("bridge-a", 0, workspaceA, pane("pane-2", "workspace-a", "tab-1", "working"), 1),
+      entry("bridge-a", 0, workspaceB, pane("pane-3", "workspace-b", "tab-1", "working"), 1),
+    ];
+
+    expect(sortScopedAgentPanes(entries, "attention").map((item) => item.pane.pane_id)).toEqual([
+      "pane-3",
+      "pane-2",
+      "pane-1",
+    ]);
+  });
+
+  it("ranks an agent carrying a transition ahead of one without", () => {
+    const workspaceA = workspace("workspace-a", 1);
+    const entries = [
+      entry("bridge-a", 0, workspaceA, pane("pane-1", "workspace-a", "tab-1", "working"), 1),
+      {
+        ...entry("bridge-a", 0, workspaceA, pane("pane-2", "workspace-a", "tab-1", "working"), 1),
+        lastStatusTransitionAt: 100,
+      },
+    ];
+
+    expect(sortScopedAgentPanes(entries, "attention").map((item) => item.pane.pane_id)).toEqual([
+      "pane-2",
+      "pane-1",
     ]);
   });
 
@@ -721,6 +828,44 @@ describe("App multi-bridge helpers", () => {
         new Set(["bridge-a:pane-b"]),
       ).map((item) => item.pane.pane_id),
     ).toEqual(["pane-b", "pane-a"]);
+  });
+
+  it("applies the attention recency tiebreak inside agent groups", () => {
+    const snapshot = multiPaneSnapshot(
+      [workspace("workspace-a", 1)],
+      [
+        pane("pane-a", "workspace-a", "tab-a", "working"),
+        pane("pane-b", "workspace-a", "tab-a", "working"),
+        pane("pane-c", "workspace-a", "tab-a", "blocked"),
+      ],
+    );
+    const bridgeViews = [bridgeView("bridge-a", snapshot)];
+    const scopedWorkspaces = buildVisibleScopedWorkspaces(
+      bridgeViews,
+      "bridge-a",
+      "selected",
+      "all",
+      null,
+      {},
+    );
+    const activity = new Map([
+      [agentActivityKey("bridge-a", "pane-a", "pane-a-terminal"), 100],
+      [agentActivityKey("bridge-a", "pane-b", "pane-b-terminal"), 300],
+      [agentActivityKey("bridge-a", "pane-c", "pane-c-terminal"), 1],
+    ]);
+
+    expect(
+      buildVisibleAgentPaneEntries(
+        scopedWorkspaces,
+        bridgeViews,
+        "selected",
+        "workspace",
+        "attention",
+        new Set(),
+        false,
+        activity,
+      ).map((item) => item.pane.pane_id),
+    ).toEqual(["pane-c", "pane-b", "pane-a"]);
   });
 
   it("sorts agents by last status change", () => {

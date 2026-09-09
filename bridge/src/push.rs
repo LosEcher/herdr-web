@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use base64::engine::general_purpose::{URL_SAFE_NO_PAD, STANDARD};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use herdr_compat::api::schema::AgentStatus;
 use serde::{Deserialize, Serialize};
@@ -286,10 +286,7 @@ pub fn parse_subscription_body(value: serde_json::Value) -> Result<PushSubscript
 }
 
 fn payload_for_alert(alert: &AgentPushAlert) -> Option<PushPayload> {
-    if !matches!(
-        alert.agent_status,
-        AgentStatus::Blocked | AgentStatus::Done
-    ) {
+    if !matches!(alert.agent_status, AgentStatus::Blocked | AgentStatus::Done) {
         return None;
     }
     let agent_label = alert
@@ -303,7 +300,12 @@ fn payload_for_alert(alert: &AgentPushAlert) -> Option<PushPayload> {
         AgentStatus::Done => format!("{agent_label} is done"),
         _ => return None,
     };
-    let body = match alert.title.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+    let body = match alert
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
         Some(value) if value != agent_label => format!("{} · {}", value, alert.pane_id),
         _ => alert.pane_id.clone(),
     };
@@ -478,6 +480,7 @@ fn is_gone_error(err: &web_push::WebPushError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
 
     #[test]
     fn parses_subscription_bodies() {
@@ -519,6 +522,9 @@ mod tests {
         assert!(!keys.public_key.is_empty());
         assert!(!keys.private_key.is_empty());
         // Public applicationServerKey is URL-safe base64 without padding.
-        assert!(URL_SAFE_NO_PAD.decode(&keys.public_key).is_ok() || STANDARD.decode(&keys.public_key).is_ok());
+        assert!(
+            URL_SAFE_NO_PAD.decode(&keys.public_key).is_ok()
+                || STANDARD.decode(&keys.public_key).is_ok()
+        );
     }
 }

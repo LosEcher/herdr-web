@@ -53,6 +53,7 @@ import type {
   MobileTouchSelectionEndpointTimeoutMs,
 } from "./mobileTerminalPrefs";
 import type { NavigationSyncMode } from "./navigationPrefs";
+import { trapFocusWithin, useFocusReturn } from "./overlayFocus";
 import { TERMINAL_INPUT_BATCH_DELAY_OPTIONS_MS } from "./terminalInputTransport";
 import type { TerminalInputTransport } from "./terminalInputTransport";
 import { TERMINAL_OUTPUT_COALESCE_OPTIONS_MS } from "./terminalOutputCoalescing";
@@ -84,6 +85,16 @@ type Props = {
   onMultiHostSpaceSelection: (enabled: boolean) => void;
   terminalFontSizePx: number;
   onTerminalFontSizePx: (value: number) => void;
+  terminalCursorBlink: boolean;
+  onTerminalCursorBlink: (enabled: boolean) => void;
+  desktopCommandComposer: boolean;
+  onDesktopCommandComposer: (enabled: boolean) => void;
+  desktopCommandEnterNewline: boolean;
+  onDesktopCommandEnterNewline: (enabled: boolean) => void;
+  terminalScreenReaderText: boolean;
+  onTerminalScreenReaderText: (enabled: boolean) => void;
+  autoRenameUploadConflicts: boolean;
+  onAutoRenameUploadConflicts: (enabled: boolean) => void;
   terminalInputTransport: TerminalInputTransport;
   onTerminalInputTransport: (transport: TerminalInputTransport) => void;
   terminalInputBatchDelayMs: number;
@@ -107,7 +118,9 @@ type Props = {
   mobileCommandExpandingInput: boolean;
   onMobileCommandExpandingInput: (enabled: boolean) => void;
   mobileCommandEnterNewline: boolean;
+  mobileCommandFocusAfterSubmit: boolean;
   onMobileCommandEnterNewline: (enabled: boolean) => void;
+  onMobileCommandFocusAfterSubmit: (enabled: boolean) => void;
   showMobileKeyboardHideRefit: boolean;
   mobileKeyboardHideRefit: boolean;
   onMobileKeyboardHideRefit: (enabled: boolean) => void;
@@ -151,6 +164,16 @@ export function BackendSettingsDialog({
   onMultiHostSpaceSelection,
   terminalFontSizePx,
   onTerminalFontSizePx,
+  terminalCursorBlink,
+  onTerminalCursorBlink,
+  desktopCommandComposer,
+  onDesktopCommandComposer,
+  desktopCommandEnterNewline,
+  onDesktopCommandEnterNewline,
+  terminalScreenReaderText,
+  onTerminalScreenReaderText,
+  autoRenameUploadConflicts,
+  onAutoRenameUploadConflicts,
   terminalInputTransport,
   onTerminalInputTransport,
   terminalInputBatchDelayMs,
@@ -172,7 +195,9 @@ export function BackendSettingsDialog({
   mobileCommandExpandingInput,
   onMobileCommandExpandingInput,
   mobileCommandEnterNewline,
+  mobileCommandFocusAfterSubmit,
   onMobileCommandEnterNewline,
+  onMobileCommandFocusAfterSubmit,
   showMobileKeyboardHideRefit,
   mobileKeyboardHideRefit,
   onMobileKeyboardHideRefit,
@@ -181,6 +206,7 @@ export function BackendSettingsDialog({
   const bridge = useBridge();
   const titleId = useId();
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  useFocusReturn();
   const [form, setForm] = useState<FormState>(() => newBackendForm(bridge.store.backends));
   const [selectionMode, setSelectionMode] = useState<SelectionMode>(
     initialSelectionMode(bridge.lastSelectedBridgeId, bridge.sameOriginAvailable),
@@ -320,7 +346,13 @@ export function BackendSettingsDialog({
 
   return (
     <div className="overlay-root">
-      <button className="overlay-scrim" type="button" aria-label="Close settings" onClick={onClose} />
+      <button
+        className="overlay-scrim"
+        type="button"
+        tabIndex={-1}
+        aria-label="Close settings"
+        onClick={onClose}
+      />
       <form
         className="modal backend-modal"
         role="dialog"
@@ -331,7 +363,9 @@ export function BackendSettingsDialog({
           if (event.key === "Escape") {
             event.preventDefault();
             onClose();
+            return;
           }
+          trapFocusWithin(event);
         }}
         onSubmit={(event) => {
           event.preventDefault();
@@ -848,6 +882,152 @@ export function BackendSettingsDialog({
                     onChange={(value) => onTerminalFontSizePx(parseTerminalFontSizePx(value))}
                   />
                 </div>
+                {!showMobileTerminalSettings ? (
+                  <div className="settings-row">
+                    <span title="Cursor blinking can be expensive in ghostty-web 0.4.0 on large high-DPI terminals">
+                      Cursor blink
+                    </span>
+                    <div
+                      className="segmented-control"
+                      role="group"
+                      aria-label="Terminal cursor blink"
+                    >
+                      <button
+                        type="button"
+                        data-on={!terminalCursorBlink}
+                        aria-pressed={!terminalCursorBlink}
+                        onClick={() => onTerminalCursorBlink(false)}
+                      >
+                        Off
+                      </button>
+                      <button
+                        type="button"
+                        data-on={terminalCursorBlink}
+                        aria-pressed={terminalCursorBlink}
+                        onClick={() => onTerminalCursorBlink(true)}
+                      >
+                        On
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+                {!showMobileTerminalSettings ? (
+                  <>
+                    <div className="settings-label">Command input</div>
+                    <div className="settings-row">
+                      <span title="Compose and edit commands below the terminal before sending them">
+                        Command composer
+                      </span>
+                      <div
+                        className="segmented-control"
+                        role="group"
+                        aria-label="Command composer"
+                      >
+                        <button
+                          type="button"
+                          data-on={!desktopCommandComposer}
+                          aria-pressed={!desktopCommandComposer}
+                          onClick={() => onDesktopCommandComposer(false)}
+                        >
+                          Off
+                        </button>
+                        <button
+                          type="button"
+                          data-on={desktopCommandComposer}
+                          aria-pressed={desktopCommandComposer}
+                          onClick={() => onDesktopCommandComposer(true)}
+                        >
+                          On
+                        </button>
+                      </div>
+                    </div>
+                    {desktopCommandComposer ? (
+                      <div className="settings-row">
+                        <span title="Use Ctrl+Enter on Windows/Linux or Cmd+Enter on macOS to send">
+                          Enter inserts newline
+                        </span>
+                        <div
+                          className="segmented-control"
+                          role="group"
+                          aria-label="Desktop composer Enter inserts newline"
+                        >
+                          <button
+                            type="button"
+                            data-on={!desktopCommandEnterNewline}
+                            aria-pressed={!desktopCommandEnterNewline}
+                            onClick={() => onDesktopCommandEnterNewline(false)}
+                          >
+                            Off
+                          </button>
+                          <button
+                            type="button"
+                            data-on={desktopCommandEnterNewline}
+                            aria-pressed={desktopCommandEnterNewline}
+                            onClick={() => onDesktopCommandEnterNewline(true)}
+                          >
+                            On
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
+                  </>
+                ) : null}
+                <div className="settings-label">Accessibility</div>
+                <div className="settings-row">
+                  <span title="Expose the visible terminal contents as screen-reader text; may add processing during heavy output">
+                    Screen-reader text
+                  </span>
+                  <div
+                    className="segmented-control"
+                    role="group"
+                    aria-label="Terminal screen-reader text"
+                  >
+                    <button
+                      type="button"
+                      data-on={!terminalScreenReaderText}
+                      aria-pressed={!terminalScreenReaderText}
+                      onClick={() => onTerminalScreenReaderText(false)}
+                    >
+                      Off
+                    </button>
+                    <button
+                      type="button"
+                      data-on={terminalScreenReaderText}
+                      aria-pressed={terminalScreenReaderText}
+                      onClick={() => onTerminalScreenReaderText(true)}
+                    >
+                      On
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-label">Uploads</div>
+                <div className="settings-row">
+                  <span title="Add a numeric suffix when an uploaded filename already exists instead of asking whether to replace it">
+                    Automatically rename conflicts
+                  </span>
+                  <div
+                    className="segmented-control"
+                    role="group"
+                    aria-label="Automatically rename conflicting uploads"
+                  >
+                    <button
+                      type="button"
+                      data-on={!autoRenameUploadConflicts}
+                      aria-pressed={!autoRenameUploadConflicts}
+                      onClick={() => onAutoRenameUploadConflicts(false)}
+                    >
+                      Off
+                    </button>
+                    <button
+                      type="button"
+                      data-on={autoRenameUploadConflicts}
+                      aria-pressed={autoRenameUploadConflicts}
+                      onClick={() => onAutoRenameUploadConflicts(true)}
+                    >
+                      On
+                    </button>
+                  </div>
+                </div>
                 <div className="settings-label">Terminal transport</div>
                 <div className="settings-row">
                   <span>Input payloads</span>
@@ -1000,6 +1180,31 @@ export function BackendSettingsDialog({
                       data-on={mobileCommandExpandingInput}
                       aria-pressed={mobileCommandExpandingInput}
                       onClick={() => onMobileCommandExpandingInput(true)}
+                    >
+                      On
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-row">
+                  <span>Focus command input after Send</span>
+                  <div
+                    className="segmented-control"
+                    role="group"
+                    aria-label="Focus command input after Send"
+                  >
+                    <button
+                      type="button"
+                      data-on={!mobileCommandFocusAfterSubmit}
+                      aria-pressed={!mobileCommandFocusAfterSubmit}
+                      onClick={() => onMobileCommandFocusAfterSubmit(false)}
+                    >
+                      Off
+                    </button>
+                    <button
+                      type="button"
+                      data-on={mobileCommandFocusAfterSubmit}
+                      aria-pressed={mobileCommandFocusAfterSubmit}
+                      onClick={() => onMobileCommandFocusAfterSubmit(true)}
                     >
                       On
                     </button>

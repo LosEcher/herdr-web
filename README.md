@@ -4,6 +4,9 @@
 > It is experimental, Herdr compatibility code is vendored, and the runtime/API shape is expected to
 > change.
 
+> This is an intentionally minimal personal development tool. Focused contributions are welcome;
+> please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+
 Browser UI for Herdr workspaces and agent panes.
 
 This repository is structured as a standalone app that can be distributed without asking users to
@@ -66,7 +69,7 @@ The top-level scripts hide that detail.
 
 For release tarball users:
 
-- A running Herdr `v0.8.0` or newer daemon/session that reports terminal protocol `19`
+- A running Herdr `v0.9.0` or newer daemon/session that reports terminal protocol `22`
 - A supported host for the downloaded bridge tarball. Current planned desktop release artifacts are
   Linux x86_64, macOS ARM64, and macOS x86_64.
 
@@ -75,7 +78,7 @@ For source development:
 - Node.js 22 or newer
 - npm
 - Rust stable
-- A running Herdr `v0.8.0` or newer daemon/session that reports terminal protocol `19`
+- A running Herdr `v0.9.0` or newer daemon/session that reports terminal protocol `22`
 
 Android development also needs a JDK and Android SDK. See [docs/android.md](docs/android.md).
 
@@ -97,7 +100,7 @@ http://127.0.0.1:8787
 ```
 
 The desktop tarball includes the web assets and `herdr-web-bridge`; it does not include Herdr.
-Start or attach Herdr `v0.8.0` or newer with terminal protocol `19` separately before running the
+Start or attach Herdr `v0.9.0` or newer with terminal protocol `22` separately before running the
 bridge.
 
 For Android, install the APK from the same release and add the bridge URL in the Bridge area of
@@ -119,23 +122,29 @@ npm install --prefix web
 
 ## Development Server (HMR)
 
-For day-to-day UI work, run the bridge and Vite together:
+Start the bridge and Vite together from the repository root:
 
 ```bash
-# Optional: point at a non-default Herdr socket (for example herdr-dev / protocol 19)
-HERDR_SOCKET_PATH=$HOME/.config/herdr-dev/herdr.sock npm run dev
+npm run dev
 ```
 
-Then open the Vite URL:
+Open `http://127.0.0.1:5173`. Vite serves the live frontend with hot module replacement and proxies
+`/api` and `/ws` to the managed bridge at `http://127.0.0.1:8787`. Stopping either process stops the
+other. The command builds the bridge when its binary is missing; after later Rust changes, stop the
+server, run `npm run bridge:build`, and restart it.
 
-```text
-http://127.0.0.1:5173
+The bridge targets the stable Herdr socket by default. Point it at another session socket or pass
+other bridge options as needed:
+
+```bash
+HERDR_SOCKET_PATH="$HOME/.config/herdr-dev/herdr.sock" npm run dev
+npm run dev -- --session SESSION_NAME
 ```
 
-Vite proxies `/api` and `/ws` to the bridge (default `http://127.0.0.1:8787`). Frontend edits hot-reload;
-Rust bridge changes still need `npm run bridge:build` and a process restart. Production-style static
-serving continues to use `npm run build` plus `scripts/run-bridge.sh` and
-`http://127.0.0.1:8787`.
+Development addresses use namespaced variables so unrelated `HOST` or `PORT` settings cannot expose
+the local bridge accidentally: `HERDR_WEB_BRIDGE_HOST`, `HERDR_WEB_BRIDGE_PORT`,
+`HERDR_WEB_DEV_HOST`, and `HERDR_WEB_DEV_PORT`. The defaults bind both servers to loopback. Advanced
+overrides are `HERDR_WEB_BRIDGE_BIN` and `HERDR_WEB_STATIC_DIR`.
 
 ## Development Build And Test
 
@@ -149,6 +158,7 @@ Useful narrower commands:
 
 ```bash
 npm run dev
+npm run test:dev
 npm run lint:web
 npm run test:web
 npm run build:web
@@ -177,7 +187,8 @@ Settings are grouped by area:
   background Web Push (service worker; requires HTTPS or localhost).
 - Display: browser-wide navigation synchronization, agent features in Tabs, multi-host Space
   selection, top/bottom app padding, and mobile terminal controls size.
-- Terminal: browser-to-bridge terminal input transport and input batching delay.
+- Terminal: font size, optional screen-reader text, upload-conflict behavior, browser-to-bridge
+  transport, and input/output batching delays.
 - Mobile: touch-specific terminal behavior when running on a coarse pointer device.
 
 Desktop alerts use the page Notification API while a tab is open. Background push uses a service
@@ -192,10 +203,31 @@ Multi-host Space selection is enabled by default, retaining one active Space per
 Space-scoped views. Turn it off under Settings → Display to keep only the selected host's Space,
 Agents, Tabs, and Notes in those views. All scope continues to show content from every host.
 
+Desktop users can enable Command composer under Settings → Terminal to edit multiline prompts
+before staging or sending them. Enter inserts a newline by default; Ctrl+Enter on Windows/Linux or
+Cmd+Enter on macOS sends the prompt. With the desktop composer enabled, automatic input focus goes
+to the composer and returns there after Send. Stage focuses the terminal to edit or run staged
+input; clicking the terminal also selects direct input, retaining that focus through reconnects.
+Desktop and mobile command drafts stay separate per bridge and
+pane while switching panes, tabs, or hosts, hiding the composer, or reconnecting. Sending or staging
+clears that pane's draft, and a successful snapshot removes drafts for closed panes. Drafts live only
+in the current browser tab's memory: reloading the page clears them, and other clients do not share them.
+
 Terminal input payloads can be sent as JSON or binary WebSocket frames. JSON remains the default;
 binary is available for comparing terminal input performance. Terminal input batching is off by
 default. When enabled, short input chunks are coalesced for `32`, `64`, `128`, or `256` ms and are
 flushed early once the pending UTF-8 input reaches 32 bytes, so paste-like input bypasses the delay.
+The web app and bridge compress terminal output with gzip when both support it. Older bridges and
+browsers keep uncompressed output.
+
+Terminal screen-reader text is off by default. Enable it under Settings → Terminal to expose each
+visible terminal viewport as bounded plain text for assistive technology. The mirror follows output,
+scrolling, resizing, and alternate-screen changes, and replaces concealed terminal cells with
+spaces. Disable it when screen-reader access is not needed to avoid the additional snapshot work.
+
+Automatic upload conflict renaming is on by default. If `image.png` already exists, another upload
+is saved as `image-1.png` without a replacement prompt. Turn it off under Settings → Terminal →
+Uploads to keep the existing Replace or Cancel prompt instead.
 
 ## Launcher Presets
 
@@ -262,7 +294,7 @@ an agent command. This preserves wrappers, SSH commands, containers, and other e
 
 ## Run Locally
 
-Start or attach a normal Herdr `v0.8.0` or newer session with terminal protocol `19` first:
+Start or attach a normal Herdr `v0.9.0` or newer session with terminal protocol `22` first:
 
 ```bash
 herdr
@@ -413,7 +445,7 @@ local `vendor/herdr-compat` crate for copied Herdr protocol/schema/client/socket
 bridge HTTP/WebSocket behavior in `bridge/src/web_bridge.rs`. A separate upstream Herdr checkout can
 be used for refreshes and drift audits, but a full `vendor/herdr` snapshot is not part of this repo.
 The cost is that `vendor/herdr-compat` must be kept compatible with Herdr protocol changes.
-The current compatibility baseline is Herdr `v0.8.0` and terminal protocol `19`; the bridge requires
+The current compatibility baseline is Herdr `v0.9.0` and terminal protocol `22`; the bridge requires
 that exact protocol rather than attempting to decode older or newer private wire formats.
 
 See [docs/vendoring.md](docs/vendoring.md) for the refresh process.

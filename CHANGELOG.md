@@ -12,9 +12,6 @@
 - Added optional Web Push + service worker support so blocked/done alerts can reach the device when
   the tab is closed. The bridge auto-generates VAPID keys (or accepts `HERDR_WEB_VAPID_*`), exposes
   `web_push` on `/api/capabilities`, and accepts `/api/push/subscribe|unsubscribe`.
-- Added `scripts/dev.sh` / `npm run dev` to run the bridge and Vite HMR frontend together for local
-  iteration (proxied `/api` and `/ws`, hot-reloading UI without rebuilding `web/dist` each change).
-  [PR #51](https://github.com/kcosr/herdr-web/pull/51)
 
 ### Changed
 
@@ -24,24 +21,183 @@
   (~300ms) so bursty API traffic does not re-query Herdr `pane.list` on every request.
 - Browser activity patches only rewrite the affected pane, workspace, and tab objects so unrelated
   sidebar entries keep stable identities.
-- Static responses now set cache headers: HTML entrypoints use `Cache-Control: no-cache`, while
-  hashed `/assets/*` files are long-cached as immutable to make production static refreshes more
-  predictable after rebuilds.
-  [PR #51](https://github.com/kcosr/herdr-web/pull/51)
+
+### Removed
+
+## [0.6.0] - 2026-09-07
+
+### Breaking Changes
+
+- Require Herdr v0.9.0 or newer with terminal protocol 22.
+  [PR #88](https://github.com/kcosr/herdr-web/pull/88).
+
+### Changed
+
+- Refresh the minimal Herdr compatibility code for v0.9.0 while retaining the existing
+  per-terminal ANSI rendering, browser input, and shared-view behavior.
+  [PR #88](https://github.com/kcosr/herdr-web/pull/88).
 
 ### Fixed
 
-- Fixed CJK / IME terminal typing so intermediate composition preedit (for example pinyin) is no
-  longer streamed into the PTY. Committed text is sent only after `compositionend`, the hidden
-  ghostty textarea is anchored near the terminal caret so the OS candidate window is usable, and
-  desktop focus is routed to that textarea (ghostty's host element is not editable after
-  contenteditable is removed, so IMEs previously had nothing reliable to attach to).
-  [PR #51](https://github.com/kcosr/herdr-web/pull/51)
-- Show in-progress IME preedit (pinyin / partial CJK) as an underlined overlay at the terminal
-  caret while composing, so composition is visible before commit.
-  [PR #51](https://github.com/kcosr/herdr-web/pull/51)
+- Use the browser's active space as the source for new-space launch directories,
+  respecting Herdr's `terminal.new_cwd` policy instead of another client's focus.
+  [PR #88](https://github.com/kcosr/herdr-web/pull/88).
+- Require explicit confirmation before closing a primary workspace and its related workspaces.
+  [PR #88](https://github.com/kcosr/herdr-web/pull/88).
+- Subscribe to live agent activity before establishing the initial status snapshot.
+  [PR #88](https://github.com/kcosr/herdr-web/pull/88).
 
-### Removed
+## [0.5.2] - 2026-09-07
+
+### Added
+
+- Add an optional mobile “Focus command input after Send” setting, off by default,
+  to refocus the cleared command field for continued typing.
+  [PR #85](https://github.com/kcosr/herdr-web/pull/85).
+
+- Added an opt-in desktop command composer under Settings → Terminal for editing multiline input
+  before sending it, without changing desktop terminal selection, scrolling, or cursor
+  behavior. [PR #82](https://github.com/kcosr/herdr-web/pull/82), contributed by
+  [Andreas Ahrens (@AndreasAhrens)](https://github.com/AndreasAhrens).
+
+### Fixed
+
+- Redraw idle Windows terminal selections and scrolling with cursor blinking disabled,
+  and apply cursor-blink changes immediately to mounted terminals.
+  [PR #87](https://github.com/kcosr/herdr-web/pull/87).
+
+- Add a Terminal setting for cursor blinking and default it off on Windows. When it is
+  off, render only for terminal updates and interactions instead of repainting the
+  high-DPI canvas continuously, avoiding severe lag in large Windows browser windows.
+  [PR #86](https://github.com/kcosr/herdr-web/pull/86).
+
+- Discard late keyboard composition updates for 250 ms after command Send or Stage so
+  submitted dictation cannot immediately repopulate the replacement input. Preserve existing
+  field replacement and focus behavior; ordinary non-composing typing and paste remain accepted.
+  New composition started within this brief window can also be discarded.
+  [PR #85](https://github.com/kcosr/herdr-web/pull/85).
+
+- Update locked development dependencies to established security-patched releases for the
+  Capacitor, lint, test, and frontend build tools, preserving cross-platform optional packages.
+  [PR #85](https://github.com/kcosr/herdr-web/pull/85).
+
+- Focus the enabled desktop command composer on terminal attach and navigation focus requests,
+  after closing Settings, and after Send, including Ctrl+Enter and Cmd+Enter. Direct terminal
+  clicks retain focus through reconnects and immediately after a default focus request. Desktop
+  Stage focuses the terminal to edit or run the staged input; mobile keyboard behavior
+  remains unchanged. [PR #82](https://github.com/kcosr/herdr-web/pull/82).
+
+- Keep unsent desktop and mobile command drafts per bridge and pane while navigating, until
+  sent, staged, or the pane is confirmed closed. Drafts remain in memory for the current browser
+  tab only. [PR #82](https://github.com/kcosr/herdr-web/pull/82).
+
+- Fixed desktop terminal copy shortcuts so copying selected text no longer also sends Ctrl+C to
+  the PTY; Ctrl+C without a selection and Ctrl+C on macOS retain their normal interrupt behavior.
+  [PR #84](https://github.com/kcosr/herdr-web/pull/84), contributed by
+  [Andreas Ahrens (@AndreasAhrens)](https://github.com/AndreasAhrens).
+
+## [0.5.1] - 2026-09-04
+
+### Added
+
+- Added a bundled JetBrainsMono Nerd Font Mono fallback for special terminal and LLM output glyphs
+  on devices without an accessible Nerd Font.
+  [PR #74](https://github.com/kcosr/herdr-web/pull/74), contributed by
+  [Craig P. Motlin (@motlin)](https://github.com/motlin).
+
+### Changed
+
+- Upload conflicts are now atomically de-duplicated by default: re-uploading `image.png` lands as
+  `image-1.png` instead of prompting to replace the original, including when uploads race. Turn off
+  automatic conflict renaming under Settings → Terminal → Uploads to keep the Replace or Cancel
+  prompt. Existing files are replaced only after explicit confirmation.
+  [PR #77](https://github.com/kcosr/herdr-web/pull/77), contributed by
+  [Trillium Smith (@trillium)](https://github.com/trillium).
+
+## [0.5.0] - 2026-08-21
+
+### Breaking Changes
+
+- The bridge now requires Herdr `v0.8.2` or newer reporting terminal protocol `20`. Herdr
+  `v0.8.0` and `v0.8.1` daemons (protocol `19`) are rejected at startup.
+  [PR #69](https://github.com/kcosr/herdr-web/pull/69)
+
+### Changed
+
+- Refreshed the vendored Herdr compatibility sources to the `v0.8.2`/protocol `20` baseline.
+  The new protocol `20` server message variants (`TerminalBell`, `GraphicsFile`,
+  `GraphicsTransmissionRetired`) decode but are ignored by the bridge, adding no new behavior.
+  [PR #69](https://github.com/kcosr/herdr-web/pull/69)
+- Compress terminal output with gzip when the client and bridge both support it.
+  [PR #59](https://github.com/kcosr/herdr-web/pull/59), contributed by
+  [Will Hampson (@Whamp)](https://github.com/Whamp).
+- Changed the Attention agent sort to break ties within an attention band by the most recent agent
+  status change, matching Herdr's Priority agent panel, and kept the existing bridge, Space, and tab
+  order as the fallback for agents with no recorded transition.
+  [PR #68](https://github.com/kcosr/herdr-web/pull/68), contributed by
+  [Craig P. Motlin (@motlin)](https://github.com/motlin).
+- Stop blinking the terminal cursor on touch devices so idle terminals do not keep redrawing.
+  Desktop cursors still blink.
+  [PR #60](https://github.com/kcosr/herdr-web/pull/60), contributed by
+  [Will Hampson (@Whamp)](https://github.com/Whamp).
+
+### Fixed
+
+- Join canvas-wrapped HTTP(S) URLs when copying from a mobile terminal.
+  [PR #61](https://github.com/kcosr/herdr-web/pull/61), contributed by
+  [Will Hampson (@Whamp)](https://github.com/Whamp).
+
+## [0.4.3] - 2026-08-17
+
+### Added
+
+- Added an optional screen-reader text mirror for visible terminal contents, with bounded updates
+  and concealed-cell filtering. [PR #64](https://github.com/kcosr/herdr-web/pull/64), based on the
+  concept proposed by
+  [shuv (@shuv1337)](https://github.com/shuv1337) in
+  [PR #37](https://github.com/kcosr/herdr-web/pull/37).
+
+### Fixed
+
+- Improved keyboard focus behavior for dialogs and action menus: modal focus stays contained,
+  menus support arrow, Home, and End navigation, Tab exits menus normally, and dismissing an
+  overlay restores its opener. [PR #62](https://github.com/kcosr/herdr-web/pull/62), based on work
+  proposed by [shuv (@shuv1337)](https://github.com/shuv1337) in
+  [PR #37](https://github.com/kcosr/herdr-web/pull/37).
+
+## [0.4.2] - 2026-08-15
+
+### Added
+
+- Added `npm run dev` to supervise the bridge and Vite HMR server together, wait for bridge
+  readiness, proxy API and WebSocket traffic, and stop both processes cleanly.
+  [PR #57](https://github.com/kcosr/herdr-web/pull/57), based on work proposed by
+  [Hopkins (@LosEcher)](https://github.com/LosEcher) in
+  [PR #51](https://github.com/kcosr/herdr-web/pull/51).
+- Declared the existing Herdr logo as the browser favicon.
+  [PR #56](https://github.com/kcosr/herdr-web/pull/56), contributed by
+  [Craig P. Motlin (@motlin)](https://github.com/motlin).
+
+### Changed
+
+- Static bridge responses now explicitly revalidate HTML and public files while caching successful
+  content-hashed Vite assets as immutable. Error responses are never marked immutable.
+  [PR #57](https://github.com/kcosr/herdr-web/pull/57), based on work proposed by
+  [Hopkins (@LosEcher)](https://github.com/LosEcher) in
+  [PR #51](https://github.com/kcosr/herdr-web/pull/51).
+
+### Fixed
+
+- Fixed CJK and other IME terminal input so preedit stays local, committed text is sent exactly
+  once, canceled composition is discarded, and the candidate window and visible preedit stay near
+  the terminal cursor. [PR #58](https://github.com/kcosr/herdr-web/pull/58), based on work proposed
+  by [Hopkins (@LosEcher)](https://github.com/LosEcher) in
+  [PR #51](https://github.com/kcosr/herdr-web/pull/51).
+- Fixed icons rendering slightly off-center in square icon buttons (sidebar section header
+  actions and the tab bar's new-tab button) by resetting the user-agent button padding, and
+  removed the per-icon transform that compensated for it.
+  [PR #55](https://github.com/kcosr/herdr-web/pull/55), contributed by
+  [Philippe SEGATORI (@tigitz)](https://github.com/tigitz).
 
 ## [0.4.1] - 2026-08-05
 

@@ -21,6 +21,8 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{extract::Request as AxumRequest, Json, Router};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use futures_util::{SinkExt, StreamExt};
 use herdr_compat::TryClone as _;
 use serde::{Deserialize, Serialize};
@@ -39,14 +41,12 @@ use herdr_compat::api::schema::{
     SubscriptionEventKind, TabCreateParams, TabInfo, TabListParams, TabTarget, WorkspaceInfo,
 };
 use herdr_compat::protocol::{
-    self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientLaunchMode,
-    ClientMessage, RenderEncoding, ServerMessage, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE,
-    PROTOCOL_VERSION,
+    self, AttachScrollDirection, AttachScrollSource, ClientMessage, RenderEncoding, ServerMessage,
+    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 
 use crate::agent_activity::{AgentActivityListResponse, AgentActivityManager};
 use crate::agent_pins::{AgentPinsError, AgentPinsListResponse, AgentPinsManager};
-use crate::push::{parse_subscription_body, AgentPushAlert, PushManager, WebPushCapability};
 use crate::launcher_presets::{
     layout_leaf_for_preset, split_layout_with_command_preset, CustomCommandPreset,
     LauncherPresetLaunch, LauncherPresetStore, ManagedAgentKind, ResolvedLauncherPreset,
@@ -56,14 +56,15 @@ use crate::notes::{
     AttachNoteRequest, CreateNoteRequest, NoteResponse, NotesError, NotesListQuery,
     NotesListResponse, NotesManager, RevisionRequest, UpdateNoteRequest,
 };
+use crate::push::{parse_subscription_body, AgentPushAlert, PushManager, WebPushCapability};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8787;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_STATIC_DIR: &str = "web/dist";
-const MIN_HERDR_VERSION: (u64, u64, u64) = (0, 8, 0);
-const MIN_HERDR_VERSION_LABEL: &str = "0.8.0";
+const MIN_HERDR_VERSION: (u64, u64, u64) = (0, 9, 0);
+const MIN_HERDR_VERSION_LABEL: &str = "0.9.0";
 const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 const MAX_NOTES_REQUEST_BYTES: usize = 512 * 1024;
 const MAX_TERMINAL_INPUT_CHUNK_BYTES: usize = 768 * 1024;
@@ -76,6 +77,11 @@ const DEFAULT_TERMINAL_OUTPUT_COALESCE_MS: u64 = 16;
 const MAX_TERMINAL_OUTPUT_COALESCE_MS: u64 = 256;
 const TERMINAL_OUTPUT_COALESCE_MAX_BYTES: usize = 32 * 1024;
 const TERMINAL_OUTPUT_COALESCE_MAX_CHUNKS: usize = 256;
+const TERMINAL_OUTPUT_FRAME_RAW: u8 = 0;
+const TERMINAL_OUTPUT_FRAME_GZIP: u8 = 1;
+const TERMINAL_OUTPUT_GZIP_MIN_BYTES: usize = 256;
+const TERMINAL_OUTPUT_GZIP_ACKNOWLEDGEMENT: &str =
+    r#"{"type":"terminal_output_encoding","encoding":"gzip"}"#;
 const DAEMON_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTIVITY_WATCHER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const ACTIVITY_WATCHER_MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -215,6 +221,7 @@ struct TerminalQuery {
     cols: Option<u16>,
     rows: Option<u16>,
     coalesce_ms: Option<u64>,
+    output_encoding: Option<TerminalOutputWireEncoding>,
     #[serde(default)]
     takeover: bool,
 }
@@ -255,6 +262,13 @@ fn default_scroll_lines() -> u16 {
 enum TerminalOutput {
     Bytes(Bytes),
     Close(String),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TerminalOutputWireEncoding {
+    Identity,
+    Gzip,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -534,6 +548,38 @@ impl TerminalOutputCoalescer {
     fn record_coalesced_send(&mut self, _chunks: usize, _bytes: usize, _latency: Duration) {}
 }
 
+fn gzip_fast(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(bytes).ok()?;
+    encoder.finish().ok()
+}
+
+fn encode_terminal_output_frame(bytes: Bytes, encoding: TerminalOutputWireEncoding) -> Bytes {
+    if encoding == TerminalOutputWireEncoding::Identity {
+        return bytes;
+    }
+
+    if bytes.len() >= TERMINAL_OUTPUT_GZIP_MIN_BYTES {
+        if let Some(compressed) = gzip_fast(&bytes) {
+            if compressed.len() < bytes.len() {
+                let mut frame = Vec::with_capacity(compressed.len() + 1);
+                frame.push(TERMINAL_OUTPUT_FRAME_GZIP);
+                frame.extend_from_slice(&compressed);
+                return Bytes::from(frame);
+            }
+        }
+    }
+
+    raw_terminal_output_frame(bytes)
+}
+
+fn raw_terminal_output_frame(bytes: Bytes) -> Bytes {
+    let mut frame = Vec::with_capacity(bytes.len() + 1);
+    frame.push(TERMINAL_OUTPUT_FRAME_RAW);
+    frame.extend_from_slice(&bytes);
+    Bytes::from(frame)
+}
+
 fn drain_terminal_output_pending(
     pending: &mut Vec<Bytes>,
     pending_bytes: &mut usize,
@@ -676,6 +722,7 @@ enum BridgeError {
 enum UploadError {
     BadRequest(String),
     Conflict { name: String, path: String },
+    NameExhausted(String),
     Forbidden(String),
     TooLarge,
     Io(io::Error),
@@ -755,6 +802,15 @@ impl IntoResponse for UploadError {
                     "error": "file exists",
                     "name": name,
                     "path": path,
+                }),
+            ),
+            Self::NameExhausted(name) => (
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": format!(
+                        "no available filename for {name} after {MAX_UPLOAD_NAME_ATTEMPTS} attempts"
+                    ),
+                    "name": name,
                 }),
             ),
             Self::Forbidden(message) => (
@@ -1091,6 +1147,7 @@ async fn run_server(options: BridgeOptions) -> io::Result<()> {
         .route("/ws/terminal", get(terminal_ws_handler))
         .fallback_service(
             ServiceBuilder::new()
+                .layer(middleware::from_fn(add_static_cache_headers))
                 .layer(CompressionLayer::new())
                 .service(ServeDir::new(options.static_dir)),
         )
@@ -1112,7 +1169,6 @@ async fn add_security_headers(
     next: Next,
 ) -> Response {
     let cors_origin = cors_origin_header(request.headers(), &policy);
-    let request_path = request.uri().path().to_string();
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(
@@ -1123,28 +1179,32 @@ async fn add_security_headers(
         HeaderName::from_static("content-security-policy"),
         content_security_policy(&policy),
     );
-    insert_static_cache_headers(headers, &request_path);
     if let Some(origin) = cors_origin {
         insert_cors_headers(headers, origin);
     }
     response
 }
 
-/// Cache policy for the static SPA: never sticky-cache HTML entrypoints; long-cache hashed assets.
-fn insert_static_cache_headers(headers: &mut HeaderMap, path: &str) {
-    if headers.contains_key(CACHE_CONTROL) {
+async fn add_static_cache_headers(request: AxumRequest, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+    let status = response.status();
+    insert_static_cache_header(response.headers_mut(), &path, status);
+    response
+}
+
+fn insert_static_cache_header(headers: &mut HeaderMap, path: &str, status: StatusCode) {
+    if headers.contains_key(CACHE_CONTROL)
+        || (!status.is_success() && status != StatusCode::NOT_MODIFIED)
+    {
         return;
     }
-    if path == "/" || path.ends_with(".html") {
-        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-        return;
-    }
-    if path.starts_with("/assets/") {
-        headers.insert(
-            CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=31536000, immutable"),
-        );
-    }
+    let value = if path.starts_with("/assets/") {
+        HeaderValue::from_static("public, max-age=31536000, immutable")
+    } else {
+        HeaderValue::from_static("no-cache")
+    };
+    headers.insert(CACHE_CONTROL, value);
 }
 
 async fn preflight_handler(
@@ -1286,6 +1346,94 @@ fn finalize_upload_file_name(name: String) -> Option<String> {
     } else {
         Some(name)
     }
+}
+
+/// How many `name-N.ext` variants to try before giving up on de-duplicating an
+/// upload. Deep enough for real usage, bounded so a pathological upload
+/// directory cannot spin the handler forever.
+const MAX_UPLOAD_NAME_ATTEMPTS: u32 = 1000;
+
+/// Split a sanitized upload name into stem and extension. `sanitize_upload_file_name`
+/// strips leading and trailing dots, so a dotfile (`.bashrc`) never reaches
+/// here with an empty stem.
+fn split_upload_name_extension(name: &str) -> Option<(&str, &str)> {
+    let (stem, extension) = name.rsplit_once('.')?;
+    if stem.is_empty() || extension.is_empty() {
+        return None;
+    }
+    Some((stem, extension))
+}
+
+/// The `attempt`-th candidate for `name`: attempt 0 is the original filename,
+/// later attempts suffix the stem (`notes.txt` -> `notes-1.txt`). The suffix
+/// never introduces a path separator, so a candidate stays a direct child of
+/// the upload directory whenever `name` was.
+fn upload_name_candidate(name: &str, attempt: u32) -> String {
+    if attempt == 0 {
+        return name.to_string();
+    }
+    match split_upload_name_extension(name) {
+        Some((stem, extension)) => format!("{stem}-{attempt}.{extension}"),
+        None => format!("{name}-{attempt}"),
+    }
+}
+
+/// Atomically reserve and write a new upload. When rename conflicts is enabled,
+/// an occupied candidate advances to the next suffix without a separate
+/// filesystem scan, so concurrent uploads cannot select the same free name.
+async fn create_new_upload(
+    upload_dir: &Path,
+    requested_name: &str,
+    body: &[u8],
+    rename_conflicts: bool,
+) -> Result<(String, PathBuf), UploadError> {
+    let attempts = if rename_conflicts {
+        MAX_UPLOAD_NAME_ATTEMPTS
+    } else {
+        1
+    };
+    for attempt in 0..attempts {
+        let name = upload_name_candidate(requested_name, attempt);
+        let destination = upload_dir.join(&name);
+        if !is_direct_child(upload_dir, &destination) {
+            return Err(UploadError::BadRequest("invalid file name".to_string()));
+        }
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .await
+        {
+            Ok(mut file) => {
+                use tokio::io::AsyncWriteExt;
+
+                if let Err(err) = async {
+                    file.write_all(body).await?;
+                    file.flush().await
+                }
+                .await
+                {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&destination).await;
+                    return Err(UploadError::Io(err));
+                }
+                return Ok((name, destination));
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists && rename_conflicts => continue,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                info!(
+                    name = %name,
+                    "herdr-web-bridge upload conflict"
+                );
+                return Err(UploadError::Conflict {
+                    name,
+                    path: destination.display().to_string(),
+                });
+            }
+            Err(err) => return Err(UploadError::Io(err)),
+        }
+    }
+    Err(UploadError::NameExhausted(requested_name.to_string()))
 }
 
 fn generated_upload_name(mime: Option<&str>) -> String {
@@ -1742,6 +1890,8 @@ struct UploadQuery {
     name: Option<String>,
     #[serde(default)]
     overwrite: bool,
+    #[serde(default)]
+    rename_conflicts: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2149,6 +2299,7 @@ fn launch_builtin_shell_split(
             cwd: None,
             focus: true,
             env: HashMap::new(),
+            right_click: Default::default(),
         }),
     )?;
     let ResponseResult::PaneInfo { pane } = result else {
@@ -2228,6 +2379,7 @@ fn launch_managed_agent_split(
             cwd: None,
             focus: true,
             env: HashMap::new(),
+            right_click: Default::default(),
         }),
     )?;
     let ResponseResult::PaneInfo { pane } = result else {
@@ -2737,57 +2889,35 @@ async fn upload_handler(
         bytes = body.len(),
         mime = ?mime,
         overwrite = query.overwrite,
+        rename_conflicts = query.rename_conflicts,
         "herdr-web-bridge upload request"
     );
-    let name = match query.name.as_deref().and_then(sanitize_upload_file_name) {
+    let requested_name = match query.name.as_deref().and_then(sanitize_upload_file_name) {
         Some(name) => name,
         None => generated_upload_name(mime.as_deref()),
     };
-    let destination = state.upload_dir.join(&name);
-    if !is_direct_child(&state.upload_dir, &destination) {
-        return Err(UploadError::BadRequest("invalid file name".to_string()));
-    }
-
     tokio::fs::create_dir_all(&state.upload_dir).await?;
-    let existing = tokio::fs::symlink_metadata(&destination).await.ok();
-    if let Some(existing) = existing {
-        if !query.overwrite {
-            info!(
-                name = %name,
-                "herdr-web-bridge upload conflict"
-            );
-            return Err(UploadError::Conflict {
-                name,
-                path: destination.display().to_string(),
-            });
-        }
-        if existing.file_type().is_symlink() || existing.is_dir() {
-            return Err(UploadError::BadRequest(
-                "refusing to overwrite non-file path".to_string(),
-            ));
-        }
-    }
-
-    if !query.overwrite {
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&destination)
-            .await
-        {
-            Ok(mut file) => {
-                tokio::io::AsyncWriteExt::write_all(&mut file, &body).await?;
-                tokio::io::AsyncWriteExt::flush(&mut file).await?;
-            }
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-                return Err(UploadError::Conflict {
-                    name,
-                    path: destination.display().to_string(),
-                });
-            }
-            Err(err) => return Err(UploadError::Io(err)),
-        }
+    let (name, destination) = if !query.overwrite {
+        create_new_upload(
+            &state.upload_dir,
+            &requested_name,
+            &body,
+            query.rename_conflicts,
+        )
+        .await?
     } else {
+        let name = requested_name;
+        let destination = state.upload_dir.join(&name);
+        if !is_direct_child(&state.upload_dir, &destination) {
+            return Err(UploadError::BadRequest("invalid file name".to_string()));
+        }
+        if let Ok(existing) = tokio::fs::symlink_metadata(&destination).await {
+            if existing.file_type().is_symlink() || existing.is_dir() {
+                return Err(UploadError::BadRequest(
+                    "refusing to overwrite non-file path".to_string(),
+                ));
+            }
+        }
         let temp_path = state.upload_dir.join(format!(
             ".herdr-web-upload-{}-{}.tmp",
             std::process::id(),
@@ -2804,7 +2934,8 @@ async fn upload_handler(
                 return Err(UploadError::Io(err));
             }
         }
-    }
+        (name, destination)
+    };
 
     let response = UploadResponse {
         file: UploadEntry {
@@ -2947,10 +3078,7 @@ fn maybe_broadcast_web_push(state: &BridgeState, alert: AgentPushAlert) {
     if !state.push.is_enabled() {
         return;
     }
-    if !matches!(
-        alert.agent_status,
-        AgentStatus::Blocked | AgentStatus::Done
-    ) {
+    if !matches!(alert.agent_status, AgentStatus::Blocked | AgentStatus::Done) {
         return;
     }
     let push = state.push.clone();
@@ -3568,6 +3696,9 @@ async fn handle_terminal_socket(socket: WebSocket, state: BridgeState, query: Te
     let cols = query.cols.unwrap_or(DEFAULT_COLS);
     let rows = query.rows.unwrap_or(DEFAULT_ROWS);
     let coalesce_window = terminal_output_coalesce_window(query.coalesce_ms);
+    let output_encoding = query
+        .output_encoding
+        .unwrap_or(TerminalOutputWireEncoding::Identity);
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let session = match acquire_terminal_session(
         state.clone(),
@@ -3589,12 +3720,21 @@ async fn handle_terminal_socket(socket: WebSocket, state: BridgeState, query: Te
 
     let write_tx = session.write_tx.clone();
     let mut terminal_rx = session.output_tx.subscribe();
+    if output_encoding == TerminalOutputWireEncoding::Gzip {
+        let ack = Message::Text(TERMINAL_OUTPUT_GZIP_ACKNOWLEDGEMENT.into());
+        if ws_sender.send(ack).await.is_err() {
+            release_terminal_session(&state.terminal_sessions, &terminal_id, &session);
+            return;
+        }
+    }
+
     let mut output_coalescer = TerminalOutputCoalescer::new(coalesce_window);
     let _ = write_tx.send(ClientMessage::Resize {
         cols,
         rows,
         cell_width_px: 0,
         cell_height_px: 0,
+        pixel_mouse: false,
     });
 
     loop {
@@ -3605,6 +3745,7 @@ async fn handle_terminal_socket(socket: WebSocket, state: BridgeState, query: Te
                     if !handle_terminal_output_deadline(
                         &mut ws_sender,
                         &mut output_coalescer,
+                        output_encoding,
                     )
                     .await
                     {
@@ -3621,6 +3762,7 @@ async fn handle_terminal_socket(socket: WebSocket, state: BridgeState, query: Te
                         output,
                         &mut ws_sender,
                         &mut output_coalescer,
+                        output_encoding,
                     )
                     .await
                     {
@@ -3636,6 +3778,7 @@ async fn handle_terminal_socket(socket: WebSocket, state: BridgeState, query: Te
                         output,
                         &mut ws_sender,
                         &mut output_coalescer,
+                        output_encoding,
                     )
                     .await
                     {
@@ -3658,6 +3801,7 @@ async fn handle_terminal_socket(socket: WebSocket, state: BridgeState, query: Te
 async fn handle_terminal_output_deadline(
     ws_sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     output_coalescer: &mut TerminalOutputCoalescer,
+    output_encoding: TerminalOutputWireEncoding,
 ) -> bool {
     let Some(reason) = output_coalescer.handle_deadline() else {
         return true;
@@ -3665,23 +3809,35 @@ async fn handle_terminal_output_deadline(
     let Some(bytes) = output_coalescer.flush_pending(reason, Instant::now()) else {
         return true;
     };
-    if ws_sender.send(Message::Binary(bytes)).await.is_err() {
-        return false;
-    }
-    true
+    send_terminal_output_frame(ws_sender, bytes, output_encoding).await
+}
+
+async fn send_terminal_output_frame(
+    ws_sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    bytes: Bytes,
+    output_encoding: TerminalOutputWireEncoding,
+) -> bool {
+    ws_sender
+        .send(Message::Binary(encode_terminal_output_frame(
+            bytes,
+            output_encoding,
+        )))
+        .await
+        .is_ok()
 }
 
 async fn handle_terminal_output_message(
     output: Result<TerminalOutput, tokio::sync::broadcast::error::RecvError>,
     ws_sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     output_coalescer: &mut TerminalOutputCoalescer,
+    output_encoding: TerminalOutputWireEncoding,
 ) -> bool {
     match output {
         Ok(TerminalOutput::Bytes(bytes)) => {
             let decision = output_coalescer.push_bytes(bytes, Instant::now());
             match decision {
                 TerminalOutputCoalescingDecision::SendNow(bytes) => {
-                    if ws_sender.send(Message::Binary(bytes)).await.is_err() {
+                    if !send_terminal_output_frame(ws_sender, bytes, output_encoding).await {
                         return false;
                     }
                 }
@@ -3690,7 +3846,7 @@ async fn handle_terminal_output_message(
                     let Some(bytes) = output_coalescer.flush_pending(reason, Instant::now()) else {
                         return true;
                     };
-                    if ws_sender.send(Message::Binary(bytes)).await.is_err() {
+                    if !send_terminal_output_frame(ws_sender, bytes, output_encoding).await {
                         return false;
                     }
                 }
@@ -3701,7 +3857,7 @@ async fn handle_terminal_output_message(
             if let Some(bytes) =
                 output_coalescer.flush_pending(TerminalOutputFlushReason::Close, Instant::now())
             {
-                if ws_sender.send(Message::Binary(bytes)).await.is_err() {
+                if !send_terminal_output_frame(ws_sender, bytes, output_encoding).await {
                     return false;
                 }
             }
@@ -4131,29 +4287,18 @@ fn run_agent_activity_subscription(
 ) -> Result<(), BridgeError> {
     drain_resubscribe_signals(resubscribe_rx);
     invalidate_pane_list_cache(state);
+    // Discover targets first; this is not the authoritative activity baseline.
     let panes = current_panes(&state.api)?;
     store_pane_list_cache(state, &panes);
-    observe_agent_activity_snapshot(state, &panes);
     let pane_ids = sorted_pane_ids(&panes);
     if pane_ids.is_empty() {
         wait_for_resubscribe_signal(resubscribe_rx)?;
         return Ok(());
     }
-    let request = Request {
-        id: "herdr-web:activity".to_string(),
-        method: Method::EventsSubscribe(EventsSubscribeParams {
-            subscriptions: activity_subscriptions(&pane_ids),
-        }),
+    let Some((baseline, mut stream)) = open_activity_subscription(&state.api, &pane_ids)? else {
+        return Ok(());
     };
-    let (ack, mut stream) = state.api.subscribe_value(&request, None)?;
-    let response = herdr_compat::api::client::parse_response_value(ack)?;
-    if !matches!(response.result, ResponseResult::SubscriptionStarted {}) {
-        return Err(BridgeError::Protocol(format!(
-            "unexpected subscription response: {:?}",
-            response.result
-        )));
-    }
-    stream.set_read_timeout(ACTIVITY_READ_TIMEOUT)?;
+    observe_agent_activity_snapshot(state, &baseline);
 
     loop {
         if drain_resubscribe_signals(resubscribe_rx) {
@@ -4209,6 +4354,36 @@ fn run_agent_activity_subscription(
             Err(err) => return Err(err.into()),
         }
     }
+}
+
+fn open_activity_subscription(
+    api: &ApiClient,
+    pane_ids: &[String],
+) -> Result<Option<(Vec<PaneInfo>, herdr_compat::api::client::EventStream)>, BridgeError> {
+    let request = Request {
+        id: "herdr-web:activity".to_string(),
+        method: Method::EventsSubscribe(EventsSubscribeParams {
+            subscriptions: activity_subscriptions(pane_ids),
+        }),
+    };
+    let (ack, stream) = api.subscribe_value(&request, None)?;
+    let response = herdr_compat::api::client::parse_response_value(ack)?;
+    if !matches!(response.result, ResponseResult::SubscriptionStarted {}) {
+        return Err(BridgeError::Protocol(format!(
+            "unexpected subscription response: {:?}",
+            response.result
+        )));
+    }
+    stream.set_read_timeout(ACTIVITY_READ_TIMEOUT)?;
+
+    // v0.9 subscriptions are live-only. Snapshot only after the subscription is
+    // acknowledged, then consume the buffered stream in order. If membership
+    // changed while subscribing, restart with the new targets before publishing.
+    let baseline = current_panes(api)?;
+    if activity_resubscribe_needed(pane_ids, &baseline) {
+        return Ok(None);
+    }
+    Ok(Some((baseline, stream)))
 }
 
 fn sorted_pane_ids(panes: &[PaneInfo]) -> Vec<String> {
@@ -4421,6 +4596,7 @@ fn handle_terminal_text_frame(write_tx: &TerminalWriter, text: &str) -> Result<(
                 rows,
                 cell_width_px,
                 cell_height_px,
+                pixel_mouse: false,
             })
             .map(|_| ())
             .map_err(|_| "terminal writer closed".to_string()),
@@ -4462,15 +4638,13 @@ fn open_terminal_attach(
     let mut stream = herdr_compat::ipc::connect_local_stream(&client_socket_path)?;
     protocol::write_message(
         &mut stream,
-        &ClientMessage::Hello {
+        &ClientMessage::TerminalHello {
             version: protocol_version,
             cols,
             rows,
             cell_width_px: 0,
             cell_height_px: 0,
-            requested_encoding: RenderEncoding::TerminalAnsi,
-            keybindings: ClientKeybindings::Server,
-            launch_mode: ClientLaunchMode::TerminalAttach,
+            pixel_mouse: false,
         },
     )
     .map_err(|err| BridgeError::Protocol(err.to_string()))?;
@@ -4478,7 +4652,11 @@ fn open_terminal_attach(
     let welcome: ServerMessage = protocol::read_message(&mut stream, MAX_FRAME_SIZE)
         .map_err(|err| BridgeError::Protocol(err.to_string()))?;
     match welcome {
-        ServerMessage::Welcome { error: None, .. } => {}
+        ServerMessage::Welcome {
+            version,
+            encoding: RenderEncoding::TerminalAnsi,
+            error: None,
+        } if version == protocol_version => {}
         ServerMessage::Welcome {
             error: Some(error), ..
         } => return Err(BridgeError::Protocol(error)),
@@ -4566,10 +4744,19 @@ fn open_terminal_attach(
                 | ServerMessage::WindowTitle { .. }
                 | ServerMessage::ReloadSoundConfig
                 | ServerMessage::MouseCapture { .. }
-                | ServerMessage::KittyKeyboardReportAll { .. }
-                | ServerMessage::PrefixInputSource { .. }
-                | ServerMessage::Frame(_)
-                | ServerMessage::Graphics { .. } => {}
+                | ServerMessage::DirectTerminalKeyboardProtocol { .. }
+                | ServerMessage::ClientShellKeyboardReportAll { .. }
+                | ServerMessage::ClientShellSnapshot(_)
+                | ServerMessage::PaneSurface(_)
+                | ServerMessage::PaneSurfacePatch(_)
+                | ServerMessage::SemanticNotification(_)
+                | ServerMessage::ClientShellError { .. }
+                | ServerMessage::ClientShellEndpointResponseChunk { .. }
+                | ServerMessage::EndpointControl { .. }
+                | ServerMessage::Graphics { .. }
+                | ServerMessage::TerminalBell { .. }
+                | ServerMessage::GraphicsFile { .. }
+                | ServerMessage::GraphicsTransmissionRetired { .. } => {}
             }
         }
         // By this point the Detach (if any) has been flushed and the socket
@@ -4693,6 +4880,77 @@ fn startup_daemon_error(err: BridgeError) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    #[test]
+    fn gzip_terminal_output_frame_round_trips_and_reduces_repeated_output() {
+        let payload = Bytes::from(vec![b'x'; 4096]);
+
+        let frame = encode_terminal_output_frame(payload.clone(), TerminalOutputWireEncoding::Gzip);
+
+        assert_eq!(frame[0], TERMINAL_OUTPUT_FRAME_GZIP);
+        let mut decoded = Vec::new();
+        GzDecoder::new(&frame[1..])
+            .read_to_end(&mut decoded)
+            .expect("gzip terminal output should decode");
+        assert_eq!(decoded, payload);
+        assert!(frame.len() < payload.len() / 4);
+    }
+
+    #[test]
+    fn identity_terminal_output_encoding_preserves_legacy_frames() {
+        let payload = Bytes::from_static(b"legacy terminal bytes");
+
+        let frame =
+            encode_terminal_output_frame(payload.clone(), TerminalOutputWireEncoding::Identity);
+
+        assert_eq!(frame, payload);
+    }
+
+    #[test]
+    fn gzip_terminal_output_frame_keeps_small_output_raw() {
+        let payload = Bytes::from_static(b"ready> ");
+
+        let frame = encode_terminal_output_frame(payload.clone(), TerminalOutputWireEncoding::Gzip);
+
+        assert_eq!(frame[0], TERMINAL_OUTPUT_FRAME_RAW);
+        assert_eq!(&frame[1..], payload);
+    }
+
+    #[test]
+    fn static_cache_headers_revalidate_entrypoints_and_public_files() {
+        for path in ["/", "/index.html", "/manifest.json", "/herdr-logo.svg"] {
+            let mut headers = HeaderMap::new();
+            insert_static_cache_header(&mut headers, path, StatusCode::OK);
+            assert_eq!(headers.get(CACHE_CONTROL).unwrap(), "no-cache", "{path}");
+        }
+    }
+
+    #[test]
+    fn static_cache_headers_make_successful_vite_assets_immutable() {
+        let mut headers = HeaderMap::new();
+        insert_static_cache_header(&mut headers, "/assets/index-AbCd1234.js", StatusCode::OK);
+        assert_eq!(
+            headers.get(CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[test]
+    fn static_cache_headers_do_not_cache_missing_assets() {
+        let mut headers = HeaderMap::new();
+        insert_static_cache_header(&mut headers, "/assets/missing.js", StatusCode::NOT_FOUND);
+        assert!(!headers.contains_key(CACHE_CONTROL));
+    }
+
+    #[test]
+    fn static_cache_headers_preserve_service_policy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        insert_static_cache_header(&mut headers, "/index.html", StatusCode::OK);
+        assert_eq!(headers.get(CACHE_CONTROL).unwrap(), "no-store");
+    }
 
     #[test]
     fn coalescer_sends_first_output_immediately() {
@@ -5158,7 +5416,7 @@ mod tests {
             let (mut sock, _) = listener.accept().unwrap();
             sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let hello: ClientMessage = protocol::read_message(&mut sock, MAX_FRAME_SIZE).unwrap();
-            assert!(matches!(hello, ClientMessage::Hello { .. }));
+            assert!(matches!(hello, ClientMessage::TerminalHello { .. }));
             protocol::write_message(
                 &mut sock,
                 &ServerMessage::Welcome {
@@ -5327,6 +5585,102 @@ mod tests {
         assert!(activity_resubscribe_needed(&current, &[]));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn activity_bootstrap_subscribes_before_baseline_and_rechecks_membership() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        for membership_changed in [false, true] {
+            let socket_path = PathBuf::from(format!(
+                "/tmp/herdr-activity-{}-{}.sock",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let daemon = thread::spawn(move || {
+                let accept_request = || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "API request timed out");
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(err) => panic!("accept failed: {err}"),
+                        }
+                    };
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(socket.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    (socket, request)
+                };
+                let respond = |socket: &mut UnixStream, request: &serde_json::Value, result| {
+                    writeln!(
+                        socket,
+                        "{}",
+                        serde_json::json!({
+                            "id": request["id"], "result": result,
+                        })
+                    )
+                    .unwrap();
+                };
+                let (mut subscription, request) = accept_request();
+                assert_eq!(request["method"], "events.subscribe");
+                respond(
+                    &mut subscription,
+                    &request,
+                    serde_json::json!({"type": "subscription_started"}),
+                );
+                // An event arriving during the snapshot must remain readable.
+                writeln!(subscription, "{}", serde_json::json!({
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": "pane-1", "workspace_id": "workspace-1", "agent_status": "working"}
+                })).unwrap();
+                let (mut snapshot, request) = accept_request();
+                assert_eq!(request["method"], "pane.list");
+                let mut pane = test_pane(if membership_changed {
+                    "pane-2"
+                } else {
+                    "pane-1"
+                });
+                pane.agent_status = AgentStatus::Working;
+                respond(
+                    &mut snapshot,
+                    &request,
+                    serde_json::to_value(ResponseResult::PaneList { panes: vec![pane] }).unwrap(),
+                );
+            });
+
+            let api = ApiClient::for_socket_path(socket_path.clone());
+            let result = open_activity_subscription(&api, &["pane-1".to_string()]);
+            daemon.join().unwrap();
+            std::fs::remove_file(socket_path).unwrap();
+            let result = result.unwrap();
+            if membership_changed {
+                assert!(
+                    result.is_none(),
+                    "changed targets must trigger resubscription"
+                );
+            } else {
+                let (baseline, mut stream) = result.unwrap();
+                assert_eq!(baseline[0].agent_status, AgentStatus::Working);
+                let event = stream.next_value().unwrap().unwrap();
+                assert_eq!(event["event"], "pane.agent_status_changed");
+            }
+        }
+    }
+
     #[test]
     fn web_snapshot_adapter_preserves_web_shape_and_clear_name_flags() {
         let snapshot =
@@ -5468,7 +5822,7 @@ mod tests {
 
     fn test_session_snapshot() -> SessionSnapshot {
         SessionSnapshot {
-            version: "0.8.0".to_string(),
+            version: "0.9.0".to_string(),
             protocol: PROTOCOL_VERSION,
             focused_workspace_id: Some("workspace-1".to_string()),
             focused_tab_id: Some("tab-1".to_string()),
@@ -5820,6 +6174,23 @@ mod tests {
     }
 
     #[test]
+    fn workspace_create_preserves_explicit_source_without_widening_launch_permissions() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "id": "test",
+            "method": "workspace.create",
+            "params": { "focus": true, "source_workspace_id": "ws_selected" }
+        }))
+        .unwrap();
+        assert!(validate_web_command(&request.method).is_ok());
+        let Method::WorkspaceCreate(mut params) = request.method else {
+            panic!("expected workspace.create");
+        };
+        assert_eq!(params.source_workspace_id.as_deref(), Some("ws_selected"));
+        params.cwd = Some("/tmp".into());
+        assert!(validate_web_command(&Method::WorkspaceCreate(params)).is_err());
+    }
+
+    #[test]
     fn validates_narrow_workspace_and_tab_create_commands() {
         let request: Request = serde_json::from_value(serde_json::json!({
             "id": "test",
@@ -6126,7 +6497,7 @@ mod tests {
     #[test]
     fn daemon_status_accepts_minimum_version_and_exact_protocol() {
         assert_eq!(
-            validated_daemon_protocol(runtime_status("0.8.0", PROTOCOL_VERSION)).unwrap(),
+            validated_daemon_protocol(runtime_status("0.9.0", PROTOCOL_VERSION)).unwrap(),
             PROTOCOL_VERSION
         );
         assert_eq!(
@@ -6172,7 +6543,7 @@ mod tests {
 
     #[test]
     fn daemon_status_accepts_version_prefix_and_build_metadata() {
-        for version in ["v0.8.0", "0.8.0+linux-x86-64"] {
+        for version in ["v0.9.0", "0.9.0+linux-x86-64"] {
             assert_eq!(
                 validated_daemon_protocol(runtime_status(version, PROTOCOL_VERSION)).unwrap(),
                 PROTOCOL_VERSION
@@ -6181,12 +6552,17 @@ mod tests {
     }
 
     #[test]
-    fn daemon_status_rejects_version_before_0_8_0() {
-        let error = validated_daemon_protocol(runtime_status("0.7.5", PROTOCOL_VERSION))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("too old"));
-        assert!(error.contains(MIN_HERDR_VERSION_LABEL));
+    fn daemon_status_rejects_version_before_0_9_0() {
+        for version in ["0.7.5", "0.8.0", "0.8.1", "0.8.2"] {
+            let error = validated_daemon_protocol(runtime_status(version, PROTOCOL_VERSION))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("too old"), "{version:?}: {error}");
+            assert!(
+                error.contains(MIN_HERDR_VERSION_LABEL),
+                "{version:?}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -6204,14 +6580,14 @@ mod tests {
 
     #[test]
     fn daemon_status_rejects_any_other_protocol() {
-        let older = validated_daemon_protocol(runtime_status("0.8.0", PROTOCOL_VERSION - 1))
+        let older = validated_daemon_protocol(runtime_status("0.9.0", PROTOCOL_VERSION - 1))
             .unwrap_err()
             .to_string();
         assert!(older.contains("incompatible"));
         assert!(older.contains(&PROTOCOL_VERSION.to_string()));
 
         assert!(
-            validated_daemon_protocol(runtime_status("0.8.0", PROTOCOL_VERSION + 1))
+            validated_daemon_protocol(runtime_status("0.9.0", PROTOCOL_VERSION + 1))
                 .unwrap_err()
                 .to_string()
                 .contains("incompatible")
@@ -6712,6 +7088,164 @@ mod tests {
             upload_extension_for_mime(Some("application/octet-stream")),
             None
         );
+    }
+
+    #[test]
+    fn upload_name_candidates_preserve_extensions() {
+        assert_eq!(
+            upload_name_candidate("screen shot.png", 0),
+            "screen shot.png"
+        );
+        assert_eq!(upload_name_candidate("image.png", 2), "image-2.png");
+        assert_eq!(upload_name_candidate("notes", 1), "notes-1");
+        assert_eq!(
+            upload_name_candidate("archive.tar.gz", 1),
+            "archive.tar-1.gz"
+        );
+    }
+
+    #[test]
+    fn upload_file_name_sanitization_rejects_traversal_segments() {
+        for hostile in [
+            "../secret.txt",
+            "../../../etc/passwd",
+            r"..\..\windows\system.ini",
+            "uploads/../../secret.txt",
+            "/etc/passwd",
+            r"C:\Windows\win.ini",
+            "nested/dir/report.pdf",
+            "trailing/dots/../evil.txt.",
+        ] {
+            let sanitized =
+                sanitize_upload_file_name(hostile).unwrap_or_else(|| panic!("{hostile} sanitized"));
+            assert!(
+                !sanitized.contains('/') && !sanitized.contains('\\'),
+                "{hostile} -> {sanitized} kept a separator"
+            );
+            assert_ne!(sanitized, "..", "{hostile} stayed a traversal segment");
+        }
+    }
+
+    #[test]
+    fn upload_file_name_sanitization_rejects_pure_traversal_names() {
+        for hostile in ["..", "../", "../..", r"..\", "...", "/", "", "   "] {
+            assert_eq!(
+                sanitize_upload_file_name(hostile),
+                None,
+                "{hostile} should have no usable file name"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_name_candidates_keep_sanitized_names_inside_upload_dir() {
+        let upload_dir = PathBuf::from("/tmp/herdr-web/uploads");
+        for hostile in [
+            "../secret.txt",
+            "../../../etc/passwd",
+            r"..\..\windows\system.ini",
+            "uploads/../../secret.txt",
+            "/etc/passwd",
+        ] {
+            let sanitized =
+                sanitize_upload_file_name(hostile).unwrap_or_else(|| panic!("{hostile} sanitized"));
+            let unique = upload_name_candidate(&sanitized, 1);
+            assert_ne!(
+                unique, sanitized,
+                "{hostile} should have been de-duplicated"
+            );
+            let destination = upload_dir.join(&unique);
+            assert!(
+                is_direct_child(&upload_dir, &destination),
+                "{hostile} -> {} escaped the upload directory",
+                destination.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_new_upload_preserves_existing_files_and_renames_conflicts() {
+        let dir = upload_test_dir("rename");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let (first, _) = create_new_upload(&dir, "image.png", b"first", true)
+            .await
+            .unwrap();
+        let (second, _) = create_new_upload(&dir, "image.png", b"second", true)
+            .await
+            .unwrap();
+        let (third, _) = create_new_upload(&dir, "image.png", b"third", true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            [first, second, third],
+            ["image.png", "image-1.png", "image-2.png"]
+        );
+        assert_eq!(
+            tokio::fs::read(dir.join("image.png")).await.unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            tokio::fs::read(dir.join("image-1.png")).await.unwrap(),
+            b"second"
+        );
+        assert_eq!(
+            tokio::fs::read(dir.join("image-2.png")).await.unwrap(),
+            b"third"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn create_new_upload_returns_conflict_when_renaming_is_disabled() {
+        let dir = upload_test_dir("prompt");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("image.png"), b"first")
+            .await
+            .unwrap();
+
+        let err = create_new_upload(&dir, "image.png", b"second", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            UploadError::Conflict { ref name, .. } if name == "image.png"
+        ));
+        assert_eq!(
+            tokio::fs::read(dir.join("image.png")).await.unwrap(),
+            b"first"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_uploads_atomically_reserve_distinct_names() {
+        let dir = upload_test_dir("concurrent");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let first = create_new_upload(&dir, "image.png", b"first", true);
+        let second = create_new_upload(&dir, "image.png", b"second", true);
+        let (first, second) = tokio::join!(first, second);
+        let mut names = [first.unwrap().0, second.unwrap().0];
+        names.sort();
+
+        assert_eq!(names, ["image-1.png", "image.png"]);
+        let mut contents = [
+            tokio::fs::read(dir.join("image.png")).await.unwrap(),
+            tokio::fs::read(dir.join("image-1.png")).await.unwrap(),
+        ];
+        contents.sort();
+        assert_eq!(contents, [b"first".to_vec(), b"second".to_vec()]);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    fn upload_test_dir(label: &str) -> PathBuf {
+        let suffix = UPLOAD_TEMP_COUNTER.fetch_add(1, Ordering::AcqRel);
+        std::env::temp_dir().join(format!(
+            "herdr-web-upload-{label}-{}-{suffix}",
+            std::process::id()
+        ))
     }
 
     #[test]

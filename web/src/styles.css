@@ -4,6 +4,18 @@
    scoped sections (spaces -> panes), terminal on the side / in front.
    ======================================================================== */
 
+@font-face {
+  font-family: "JetBrainsMono Nerd Font Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  unicode-range: U+2500-27BF, U+E000-F8FF, U+F0000-10FFFF;
+  src:
+    local("JetBrainsMono NFM Regular"),
+    local("JetBrainsMonoNFM-Regular"),
+    url("/fonts/JetBrainsMonoNerdFontMono-Regular.woff2") format("woff2");
+}
+
 :root {
   color-scheme: dark;
 
@@ -64,7 +76,7 @@
     sans-serif;
   --mono:
     ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "DejaVu Sans Mono", monospace;
+    "DejaVu Sans Mono", "JetBrainsMono Nerd Font Mono", monospace;
 
   font-family: var(--ui);
   background: var(--app-bg);
@@ -89,6 +101,10 @@
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+}
+
+.terminal-accessible-screen {
+  white-space: pre-wrap;
 }
 
 html,
@@ -278,6 +294,7 @@ button {
   height: 34px;
   flex: 0 0 auto;
   place-items: center;
+  padding: 0;
   border: 1px solid transparent;
   border-radius: var(--r-sm);
   color: var(--subtext0);
@@ -1057,6 +1074,7 @@ button {
   height: 26px;
   flex: 0 0 auto;
   place-items: center;
+  padding: 0;
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   color: var(--overlay1);
@@ -1708,7 +1726,7 @@ button {
 /* ------------------------------------------------------------ terminal */
 
 .terminal-stage {
-  --terminal-mobile-controls-height: calc(82px * var(--mobile-controls-scale));
+  --terminal-command-controls-height: calc(82px * var(--mobile-controls-scale));
   position: relative;
   display: flex;
   flex-direction: column;
@@ -1776,16 +1794,16 @@ button {
   margin: 0;
   border: 0;
   border-radius: 2px;
+  overflow: hidden;
   background: color-mix(in srgb, var(--surface0) 88%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--blue) 35%, transparent);
   color: var(--text);
   text-decoration: underline;
-  text-underline-offset: 2px;
-  text-decoration-thickness: 1px;
   text-decoration-color: var(--blue);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
   white-space: pre;
   pointer-events: none;
-  overflow: hidden;
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--blue) 35%, transparent);
 }
 
 .terminal-file-input {
@@ -1808,6 +1826,7 @@ button {
   width: 34px;
   height: 34px;
   place-items: center;
+  padding: 0;
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   background: color-mix(in srgb, var(--mantle) 86%, black);
@@ -1959,7 +1978,7 @@ button {
   pointer-events: none;
 }
 
-.terminal-mobile-controls {
+.terminal-command-controls {
   --mobile-control-gap: calc(5px * var(--mobile-controls-scale));
   --mobile-key-height: calc(30px * var(--mobile-controls-scale));
   --mobile-key-min-width: calc(34px * var(--mobile-controls-scale));
@@ -1969,13 +1988,18 @@ button {
   --mobile-input-row-height: calc(34px * var(--mobile-controls-scale));
   --mobile-input-padding-x: calc(10px * var(--mobile-controls-scale));
   --mobile-send-width: calc(38px * var(--mobile-controls-scale));
-  display: none;
+  display: flex;
   flex: 0 0 auto;
+  flex-direction: column;
   gap: var(--mobile-control-gap);
   padding: calc(6px * var(--mobile-controls-scale)) max(8px, env(safe-area-inset-right))
     calc(7px * var(--mobile-controls-scale)) max(8px, env(safe-area-inset-left));
   border-top: 1px solid var(--line);
   background: color-mix(in srgb, var(--mantle) 94%, black);
+}
+
+.terminal-command-controls[data-mobile-controls="false"] {
+  --mobile-controls-scale: 1;
 }
 
 .term-key-strip,
@@ -1986,6 +2010,10 @@ button {
   display: flex;
   min-width: 0;
   gap: var(--mobile-control-gap);
+}
+
+.term-key-strip[hidden] {
+  display: none;
 }
 
 .term-key-strip {
@@ -2195,6 +2223,7 @@ button {
   height: 24px;
   flex: 0 0 auto;
   place-items: center;
+  padding: 0;
   border: 1px solid var(--line);
   border-radius: var(--r-sm);
   color: var(--overlay1);
@@ -2212,11 +2241,6 @@ button {
   border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
   color: var(--accent);
   background: color-mix(in srgb, var(--accent) 12%, transparent);
-}
-
-.sec-add-pin svg,
-.sec-add-active svg {
-  transform: translateX(-1.5px);
 }
 
 .tab-head {
@@ -3340,19 +3364,20 @@ button {
   height: 60px;
 }
 
-.app[data-touch="true"] .terminal-mobile-controls {
-  display: flex;
-  flex-direction: column;
+.terminal-stage:has(.terminal-command-controls) .terminal-overlay {
+  bottom: calc(var(--terminal-command-controls-height) + 14px);
 }
 
-.app[data-touch="true"] .terminal-stage:has(.terminal-mobile-controls) .terminal-overlay {
-  bottom: calc(var(--terminal-mobile-controls-height) + 38px * var(--mobile-controls-scale));
+.terminal-stage:has(.terminal-command-controls) .terminal-upload-status,
+.terminal-stage:has(.terminal-command-controls) .terminal-selection-sheet {
+  bottom: calc(var(--terminal-command-controls-height) + 8px);
 }
 
-.app[data-touch="true"] .terminal-stage:has(.terminal-mobile-controls) .terminal-upload-status {
-  bottom: calc(var(--terminal-mobile-controls-height) + 8px * var(--mobile-controls-scale));
+.app[data-touch="true"] .terminal-stage:has(.terminal-command-controls) .terminal-overlay {
+  bottom: calc(var(--terminal-command-controls-height) + 38px * var(--mobile-controls-scale));
 }
 
-.app[data-touch="true"] .terminal-stage:has(.terminal-mobile-controls) .terminal-selection-sheet {
-  bottom: calc(var(--terminal-mobile-controls-height) + 8px * var(--mobile-controls-scale));
+.app[data-touch="true"] .terminal-stage:has(.terminal-command-controls) .terminal-upload-status,
+.app[data-touch="true"] .terminal-stage:has(.terminal-command-controls) .terminal-selection-sheet {
+  bottom: calc(var(--terminal-command-controls-height) + 8px * var(--mobile-controls-scale));
 }

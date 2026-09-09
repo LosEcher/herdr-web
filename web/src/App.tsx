@@ -1,3 +1,5 @@
+import { CommandDraftContext, createCommandDraftStore } from "./commandDrafts";
+import { linkedWorkspaceLabels } from "./workspaceClose";
 import {
   Activity,
   Archive,
@@ -111,12 +113,14 @@ import type { LauncherPresetsResponse } from "./launcherPresets";
 import { fetchWithTimeout } from "./fetchWithTimeout";
 import {
   DEFAULT_MOBILE_COMMAND_ENTER_NEWLINE,
+  DEFAULT_MOBILE_COMMAND_FOCUS_AFTER_SUBMIT,
   DEFAULT_MOBILE_COMMAND_EXPANDING_INPUT,
   DEFAULT_MOBILE_KEYBOARD_HIDE_REFIT,
   DEFAULT_MOBILE_LONG_PRESS_BEHAVIOR,
   DEFAULT_MOBILE_TOUCH_SELECTION_ENDPOINT_TIMEOUT_MS,
   DEFAULT_MOBILE_TERMINAL_TAP_TARGET,
   parseMobileCommandEnterNewline,
+  parseMobileCommandFocusAfterSubmit,
   parseMobileCommandExpandingInput,
   parseMobileKeyboardHideRefit,
   parseMobileLongPressBehavior,
@@ -155,8 +159,18 @@ import {
 import type { NavigationSyncMode } from "./navigationPrefs";
 import { ActionMenu, ConfirmDialog, RenameDialog, useLongPress } from "./overlays";
 import type { MenuItem } from "./overlays";
+import {
+  focusableElements,
+  focusOverlayTrigger,
+  trapFocusWithin,
+  useFocusReturn,
+} from "./overlayFocus";
 import { createSnapshotRefreshController } from "./refreshCoordinator";
 import { TerminalView } from "./TerminalView";
+import {
+  DEFAULT_TERMINAL_SCREEN_READER_TEXT,
+  parseTerminalScreenReaderText,
+} from "./terminalAccessibleText";
 import {
   DEFAULT_TERMINAL_INPUT_BATCH_DELAY_MS,
   DEFAULT_TERMINAL_INPUT_TRANSPORT,
@@ -169,9 +183,19 @@ import {
   parseTerminalOutputCoalesceMs,
 } from "./terminalOutputCoalescing";
 import {
+  DEFAULT_DESKTOP_COMMAND_COMPOSER,
+  DEFAULT_DESKTOP_COMMAND_ENTER_NEWLINE,
   DEFAULT_TERMINAL_FONT_SIZE_PX,
+  defaultTerminalCursorBlink,
+  parseDesktopCommandComposer,
+  parseDesktopCommandEnterNewline,
+  parseTerminalCursorBlink,
   parseTerminalFontSizePx,
 } from "./terminalPrefs";
+import {
+  DEFAULT_AUTO_RENAME_UPLOAD_CONFLICTS,
+  parseAutoRenameUploadConflicts,
+} from "./uploadPrefs";
 import {
   aggregateStatus,
   basename,
@@ -184,7 +208,6 @@ import {
   chooseSelectedPaneForActiveWorkspace,
   countAttention,
   displayTabLabel,
-  isAttention,
   isLoud,
   paneMeta,
   paneListSubtitle,
@@ -402,6 +425,7 @@ type DialogState = {
   id: string;
   label: string;
   clearable?: boolean;
+  linkedWorkspaceLabels?: string[];
 };
 type DisplayPrefs = {
   hostScope: HostScope;
@@ -424,6 +448,11 @@ type DisplayPrefs = {
   notesPanelOpen: boolean;
   sidebarOpen: boolean;
   terminalFontSizePx: number;
+  terminalCursorBlink: boolean;
+  desktopCommandComposer: boolean;
+  desktopCommandEnterNewline: boolean;
+  terminalScreenReaderText: boolean;
+  autoRenameUploadConflicts: boolean;
   terminalInputTransport: TerminalInputTransport;
   terminalInputBatchDelayMs: number;
   terminalOutputCoalesceMs: number;
@@ -440,6 +469,7 @@ type DisplayPrefs = {
   browserNotifyOnBlocked: boolean;
   browserNotifyOnDone: boolean;
   browserDocumentBadge: boolean;
+  mobileCommandFocusAfterSubmit: boolean;
 };
 type SharedNavigationPrefs = {
   selectedBridgeId: BridgeId | null;
@@ -491,6 +521,11 @@ function readDisplayPrefs(): DisplayPrefs {
     notesPanelOpen: false,
     sidebarOpen: true,
     terminalFontSizePx: DEFAULT_TERMINAL_FONT_SIZE_PX,
+    terminalCursorBlink: defaultTerminalCursorBlink(),
+    desktopCommandComposer: DEFAULT_DESKTOP_COMMAND_COMPOSER,
+    desktopCommandEnterNewline: DEFAULT_DESKTOP_COMMAND_ENTER_NEWLINE,
+    terminalScreenReaderText: DEFAULT_TERMINAL_SCREEN_READER_TEXT,
+    autoRenameUploadConflicts: DEFAULT_AUTO_RENAME_UPLOAD_CONFLICTS,
     terminalInputTransport: DEFAULT_TERMINAL_INPUT_TRANSPORT,
     terminalInputBatchDelayMs: DEFAULT_TERMINAL_INPUT_BATCH_DELAY_MS,
     terminalOutputCoalesceMs: DEFAULT_TERMINAL_OUTPUT_COALESCE_MS,
@@ -507,6 +542,7 @@ function readDisplayPrefs(): DisplayPrefs {
     browserNotifyOnBlocked: DEFAULT_BROWSER_NOTIFICATION_PREFS.notifyOnBlocked,
     browserNotifyOnDone: DEFAULT_BROWSER_NOTIFICATION_PREFS.notifyOnDone,
     browserDocumentBadge: DEFAULT_BROWSER_NOTIFICATION_PREFS.documentBadge,
+    mobileCommandFocusAfterSubmit: DEFAULT_MOBILE_COMMAND_FOCUS_AFTER_SUBMIT,
   };
   try {
     const raw = window.localStorage.getItem(DISPLAY_PREFS_KEY);
@@ -690,6 +726,26 @@ function parseDisplayPrefsValue(
       typeof parsed.notesPanelOpen === "boolean" ? parsed.notesPanelOpen : fallback.notesPanelOpen,
     sidebarOpen,
     terminalFontSizePx: parseTerminalFontSizePx(parsed.terminalFontSizePx),
+    terminalCursorBlink: parseTerminalCursorBlink(
+      parsed.terminalCursorBlink,
+      fallback.terminalCursorBlink,
+    ),
+    desktopCommandComposer: parseDesktopCommandComposer(
+      parsed.desktopCommandComposer,
+      fallback.desktopCommandComposer,
+    ),
+    desktopCommandEnterNewline: parseDesktopCommandEnterNewline(
+      parsed.desktopCommandEnterNewline,
+      fallback.desktopCommandEnterNewline,
+    ),
+    terminalScreenReaderText: parseTerminalScreenReaderText(
+      parsed.terminalScreenReaderText,
+      fallback.terminalScreenReaderText,
+    ),
+    autoRenameUploadConflicts: parseAutoRenameUploadConflicts(
+      parsed.autoRenameUploadConflicts,
+      fallback.autoRenameUploadConflicts,
+    ),
     terminalInputTransport: parseTerminalInputTransport(parsed.terminalInputTransport),
     terminalInputBatchDelayMs: parseTerminalInputBatchDelayMs(parsed.terminalInputBatchDelayMs),
     terminalOutputCoalesceMs: parseTerminalOutputCoalesceMs(
@@ -727,6 +783,9 @@ function parseDisplayPrefsValue(
     browserDocumentBadge: parseBrowserDocumentBadge(
       parsed.browserDocumentBadge,
       fallback.browserDocumentBadge,
+    ),
+    mobileCommandFocusAfterSubmit: parseMobileCommandFocusAfterSubmit(
+      parsed.mobileCommandFocusAfterSubmit,
     ),
   };
 }
@@ -957,6 +1016,15 @@ function usePointerDragResize(
 }
 
 export function App() {
+  const [commandDrafts] = useState(createCommandDraftStore);
+  return (
+    <CommandDraftContext.Provider value={commandDrafts}>
+      <AppContent commandDrafts={commandDrafts} />
+    </CommandDraftContext.Provider>
+  );
+}
+
+function AppContent({ commandDrafts }: { commandDrafts: ReturnType<typeof createCommandDraftStore> }) {
   const bridge = useBridge();
   const initialPrefs = useMemo(readDisplayPrefs, []);
   const initialSharedNavigationPrefs = useMemo(readSharedNavigationPrefs, []);
@@ -1081,6 +1149,21 @@ export function App() {
   const [terminalFontSizePx, setTerminalFontSizePx] = useState(
     initialPrefs.terminalFontSizePx,
   );
+  const [terminalCursorBlink, setTerminalCursorBlink] = useState(
+    initialPrefs.terminalCursorBlink,
+  );
+  const [desktopCommandComposer, setDesktopCommandComposer] = useState(
+    initialPrefs.desktopCommandComposer,
+  );
+  const [desktopCommandEnterNewline, setDesktopCommandEnterNewline] = useState(
+    initialPrefs.desktopCommandEnterNewline,
+  );
+  const [terminalScreenReaderText, setTerminalScreenReaderText] = useState(
+    initialPrefs.terminalScreenReaderText,
+  );
+  const [autoRenameUploadConflicts, setAutoRenameUploadConflicts] = useState(
+    initialPrefs.autoRenameUploadConflicts,
+  );
   const [terminalInputTransport, setTerminalInputTransport] = useState(
     initialPrefs.terminalInputTransport,
   );
@@ -1136,6 +1219,9 @@ export function App() {
   });
   const openPaneFromNotificationRef = useRef<(target: BrowserNotificationTarget) => void>(
     () => undefined,
+  );
+  const [mobileCommandFocusAfterSubmit, setMobileCommandFocusAfterSubmit] = useState(
+    initialPrefs.mobileCommandFocusAfterSubmit,
   );
   const [launchTarget, setLaunchTarget] = useState<ScopedLaunchTarget | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1229,6 +1315,11 @@ export function App() {
       setSelectedPanesByBridgeId(sharedNavigationPrefs.selectedPanesByBridgeId);
       setActiveWorkspacesByBridgeId(sharedNavigationPrefs.activeWorkspacesByBridgeId);
       setTerminalFontSizePx(prefs.terminalFontSizePx);
+      setTerminalCursorBlink(prefs.terminalCursorBlink);
+      setDesktopCommandComposer(prefs.desktopCommandComposer);
+      setDesktopCommandEnterNewline(prefs.desktopCommandEnterNewline);
+      setTerminalScreenReaderText(prefs.terminalScreenReaderText);
+      setAutoRenameUploadConflicts(prefs.autoRenameUploadConflicts);
       setTerminalInputTransport(prefs.terminalInputTransport);
       setTerminalInputBatchDelayMs(prefs.terminalInputBatchDelayMs);
       setTerminalOutputCoalesceMs(prefs.terminalOutputCoalesceMs);
@@ -1245,6 +1336,7 @@ export function App() {
       setBrowserNotifyOnBlocked(prefs.browserNotifyOnBlocked);
       setBrowserNotifyOnDone(prefs.browserNotifyOnDone);
       setBrowserDocumentBadge(prefs.browserDocumentBadge);
+      setMobileCommandFocusAfterSubmit(prefs.mobileCommandFocusAfterSubmit);
       setDisplayPrefsLoaded(true);
       },
     );
@@ -1335,6 +1427,14 @@ export function App() {
       }),
     [bridge.enabledRuntimes, connectionStates],
   );
+  useEffect(() => {
+    for (const { runtime, snapshot, loadState } of bridgeViews) {
+      if (runtime.canConnect && loadState === "ready" && snapshot) {
+        commandDrafts.retainPanes(runtime.id, snapshot.panes.map((pane) => pane.pane_id));
+      }
+    }
+  }, [bridgeViews, commandDrafts]);
+
   const pinnedAgentKeys = useMemo(
     () => buildAgentPinKeySet(bridgeViews, agentPinsStates),
     [agentPinsStates, bridgeViews],
@@ -1775,6 +1875,11 @@ export function App() {
       notesPanelOpen,
       sidebarOpen,
       terminalFontSizePx,
+      terminalCursorBlink,
+      desktopCommandComposer,
+      desktopCommandEnterNewline,
+      terminalScreenReaderText,
+      autoRenameUploadConflicts,
       terminalInputTransport,
       terminalInputBatchDelayMs,
       terminalOutputCoalesceMs,
@@ -1791,6 +1896,7 @@ export function App() {
       browserNotifyOnBlocked,
       browserNotifyOnDone,
       browserDocumentBadge,
+      mobileCommandFocusAfterSubmit,
     });
   }, [
     displayPrefsLoaded,
@@ -1814,6 +1920,11 @@ export function App() {
     notesPanelOpen,
     sidebarOpen,
     terminalFontSizePx,
+    terminalCursorBlink,
+    desktopCommandComposer,
+    desktopCommandEnterNewline,
+    terminalScreenReaderText,
+    autoRenameUploadConflicts,
     terminalInputTransport,
     terminalInputBatchDelayMs,
     terminalOutputCoalesceMs,
@@ -1830,6 +1941,7 @@ export function App() {
     browserNotifyOnBlocked,
     browserNotifyOnDone,
     browserDocumentBadge,
+    mobileCommandFocusAfterSubmit,
   ]);
 
   useEffect(() => {
@@ -2201,7 +2313,7 @@ export function App() {
       return firstNote ? { bridgeId: selectedRuntimeId, noteId: firstNote.note_id } : null;
     });
   }, [selectedPaneKey, selectedPaneNotes, selectedRuntimeId]);
-  const selectedPaneMenuPress = useLongPress((x, y) => {
+  const openSelectedPaneMenu = (x: number, y: number) => {
     if (selectedPane && selectedRuntime) {
       setMenu({
         kind: "pane",
@@ -2213,7 +2325,8 @@ export function App() {
         pinLabel: isAgentPane(selectedPane) ? "agent" : "pane",
       });
     }
-  });
+  };
+  const selectedPaneMenuPress = useLongPress(openSelectedPaneMenu, openSelectedPaneMenu);
 
   useEffect(() => {
     if (isCompactLayout) {
@@ -3777,7 +3890,10 @@ export function App() {
     if (key === "rename") {
       setDialog({ mode: "rename", kind, bridgeId, id, label, clearable });
     } else if (key === "close") {
-      setDialog({ mode: "close", kind, bridgeId, id, label });
+      const linkedLabels = kind === "space"
+        ? linkedWorkspaceLabels(connectionRefs.current[bridgeId]?.snapshot?.workspaces ?? [], id)
+        : [];
+      setDialog({ mode: "close", kind, bridgeId, id, label, linkedWorkspaceLabels: linkedLabels });
     } else if (key === "newtab") {
       setSelectedBridgeId(bridgeId);
       setActiveWorkspaceRefState({ bridgeId, workspaceId: id });
@@ -3862,7 +3978,7 @@ export function App() {
     }
     const action =
       kind === "space"
-        ? () => commands.closeWorkspace(id)
+        ? () => commands.closeWorkspace(id, Boolean(dialog.linkedWorkspaceLabels?.length))
         : kind === "tab"
           ? () => commands.closeTab(id)
           : () => commands.closePane(id);
@@ -4067,7 +4183,11 @@ export function App() {
           onBackendSettings={() => setBackendSettingsOpen(true)}
           onCreateSpace={() =>
             selectedRuntime && selectedCommands
-              ? void exec(selectedRuntime, () => selectedCommands.createWorkspace(), true)
+              ? void exec(
+                  selectedRuntime,
+                  () => selectedCommands.createWorkspace(activeSpace?.workspace_id),
+                  true,
+                )
               : setError("Bridge is not ready")
           }
           onCreateTab={(bridgeId, workspaceId) =>
@@ -4168,7 +4288,21 @@ export function App() {
           >
             {isCompactLayout ? <ChevronLeft size={20} /> : <PanelLeft size={18} />}
           </button>
-          <div className="stage-id" {...selectedPaneMenuPress}>
+          <div
+            className="stage-id"
+            role="button"
+            tabIndex={0}
+            aria-haspopup="menu"
+            aria-expanded={
+              menu?.kind === "pane" &&
+              menu.bridgeId === selectedRuntime?.id &&
+              menu.id === selectedPane?.pane_id
+                ? "true"
+                : "false"
+            }
+            aria-label="Selected pane actions"
+            {...selectedPaneMenuPress}
+          >
             <span className="stage-title">{selectedPane ? paneTitle(selectedPane) : "herdr-web"}</span>
             <span className="stage-sub mono">
               {stageBreadcrumb(snapshot, selectedPane, loadState, selectedRuntime?.canConnect ?? false)}
@@ -4182,16 +4316,17 @@ export function App() {
                 aria-label="Split right"
                 title="Split right"
                 disabled={busy}
-                onClick={() =>
-                  selectedRuntime
-                    ? setLaunchTarget({
-                        mode: "split",
-                        pane: selectedPane,
-                        direction: "right",
-                        bridgeId: selectedRuntime.id,
-                      })
-                    : undefined
-                }
+                onClick={(event) => {
+                  focusOverlayTrigger(event.currentTarget);
+                  if (selectedRuntime) {
+                    setLaunchTarget({
+                      mode: "split",
+                      pane: selectedPane,
+                      direction: "right",
+                      bridgeId: selectedRuntime.id,
+                    });
+                  }
+                }}
               >
                 <SplitSquareHorizontal size={18} />
               </button>
@@ -4201,16 +4336,17 @@ export function App() {
                 aria-label="Split down"
                 title="Split down"
                 disabled={busy}
-                onClick={() =>
-                  selectedRuntime
-                    ? setLaunchTarget({
-                        mode: "split",
-                        pane: selectedPane,
-                        direction: "down",
-                        bridgeId: selectedRuntime.id,
-                      })
-                    : undefined
-                }
+                onClick={(event) => {
+                  focusOverlayTrigger(event.currentTarget);
+                  if (selectedRuntime) {
+                    setLaunchTarget({
+                      mode: "split",
+                      pane: selectedPane,
+                      direction: "down",
+                      bridgeId: selectedRuntime.id,
+                    });
+                  }
+                }}
               >
                 <SplitSquareVertical size={18} />
               </button>
@@ -4259,6 +4395,7 @@ export function App() {
         </header>
         {showSplit && splitCells ? (
           <SplitGrid
+            bridgeId={selectedRuntime?.id ?? ""}
             cells={splitCells}
             selectedPaneId={selectedPane?.pane_id ?? null}
             onSelectPane={(pane) => {
@@ -4272,13 +4409,19 @@ export function App() {
             refitToken={refitToken}
             focusToken={terminalFocusToken}
             touchInput={isTouchInput}
+            desktopCommandComposer={desktopCommandComposer}
+            desktopCommandEnterNewline={desktopCommandEnterNewline}
+            terminalCursorBlink={terminalCursorBlink}
             terminalFontSizePx={terminalFontSizePx}
+            terminalScreenReaderText={terminalScreenReaderText}
+            autoRenameUploadConflicts={autoRenameUploadConflicts}
             mobileControlsScalePercent={mobileControlsScalePercent}
             mobileTapTarget={mobileTerminalTapTarget}
             mobileLongPressBehavior={mobileLongPressBehavior}
             mobileTouchSelectionEndpointTimeoutMs={mobileTouchSelectionEndpointTimeoutMs}
             mobileCommandExpandingInput={mobileCommandExpandingInput}
             mobileCommandEnterNewline={mobileCommandEnterNewline}
+            mobileCommandFocusAfterSubmit={mobileCommandFocusAfterSubmit}
             terminalInputTransport={terminalInputTransport}
             terminalInputBatchDelayMs={terminalInputBatchDelayMs}
             terminalOutputCoalesceMs={terminalOutputCoalesceMs}
@@ -4289,6 +4432,7 @@ export function App() {
           />
         ) : renderTerminal ? (
           <TerminalView
+            bridgeId={selectedRuntime?.id ?? ""}
             pane={selectedPane}
             connectionKey={selectedRuntime?.connectionKey ?? "disconnected"}
             resumeToken={selectedRuntime?.resumeToken ?? 0}
@@ -4297,18 +4441,28 @@ export function App() {
             autoFocus={!isTouchInput}
             scrollSensitivity={isTouchInput ? 2 : 0.4}
             mobileControls={isTouchInput}
+            desktopCommandComposer={desktopCommandComposer}
+            desktopCommandEnterNewline={desktopCommandEnterNewline}
+            cursorBlink={!isTouchInput && terminalCursorBlink}
             terminalFontSizePx={terminalFontSizePx}
+            terminalScreenReaderText={terminalScreenReaderText}
+            autoRenameUploadConflicts={autoRenameUploadConflicts}
             mobileControlsScalePercent={mobileControlsScalePercent}
             mobileTapTarget={mobileTerminalTapTarget}
             mobileLongPressBehavior={mobileLongPressBehavior}
             mobileTouchSelectionEndpointTimeoutMs={mobileTouchSelectionEndpointTimeoutMs}
             mobileCommandExpandingInput={mobileCommandExpandingInput}
             mobileCommandEnterNewline={mobileCommandEnterNewline}
+            mobileCommandFocusAfterSubmit={mobileCommandFocusAfterSubmit}
             terminalInputTransport={terminalInputTransport}
             terminalInputBatchDelayMs={terminalInputBatchDelayMs}
             terminalOutputCoalesceMs={terminalOutputCoalesceMs}
             refitToken={refitToken}
             focusToken={terminalFocusToken}
+            accessibilityLabel={
+              selectedPane ? `Selected pane terminal: ${paneTitle(selectedPane)}` : "Terminal"
+            }
+            selected={Boolean(selectedPane)}
           />
         ) : (
           <div className="terminal-stage" aria-hidden="true" />
@@ -4467,9 +4621,9 @@ export function App() {
 
       {dialog?.mode === "close" ? (
         <ConfirmDialog
-          title={closeCopy(dialog.kind).title}
-          message={closeCopy(dialog.kind).message}
-          confirmLabel={closeCopy(dialog.kind).confirm}
+          title={closeCopy(dialog.kind, dialog.linkedWorkspaceLabels).title}
+          message={closeCopy(dialog.kind, dialog.linkedWorkspaceLabels).message}
+          confirmLabel={closeCopy(dialog.kind, dialog.linkedWorkspaceLabels).confirm}
           busy={busy}
           onCancel={() => setDialog(null)}
           onConfirm={confirmClose}
@@ -4547,6 +4701,16 @@ export function App() {
           onMultiHostSpaceSelection={setMultiHostSpaceSelection}
           terminalFontSizePx={terminalFontSizePx}
           onTerminalFontSizePx={setTerminalFontSizePx}
+          terminalCursorBlink={terminalCursorBlink}
+          onTerminalCursorBlink={setTerminalCursorBlink}
+          desktopCommandComposer={desktopCommandComposer}
+          onDesktopCommandComposer={setDesktopCommandComposer}
+          desktopCommandEnterNewline={desktopCommandEnterNewline}
+          onDesktopCommandEnterNewline={setDesktopCommandEnterNewline}
+          terminalScreenReaderText={terminalScreenReaderText}
+          onTerminalScreenReaderText={setTerminalScreenReaderText}
+          autoRenameUploadConflicts={autoRenameUploadConflicts}
+          onAutoRenameUploadConflicts={setAutoRenameUploadConflicts}
           terminalInputTransport={terminalInputTransport}
           onTerminalInputTransport={setTerminalInputTransport}
           terminalInputBatchDelayMs={terminalInputBatchDelayMs}
@@ -4570,11 +4734,18 @@ export function App() {
           mobileCommandExpandingInput={mobileCommandExpandingInput}
           onMobileCommandExpandingInput={setMobileCommandExpandingInput}
           mobileCommandEnterNewline={mobileCommandEnterNewline}
+          mobileCommandFocusAfterSubmit={mobileCommandFocusAfterSubmit}
           onMobileCommandEnterNewline={setMobileCommandEnterNewline}
+          onMobileCommandFocusAfterSubmit={setMobileCommandFocusAfterSubmit}
           showMobileKeyboardHideRefit={showMobileKeyboardHideRefit}
           mobileKeyboardHideRefit={mobileKeyboardHideRefit}
           onMobileKeyboardHideRefit={setMobileKeyboardHideRefit}
-          onClose={() => setBackendSettingsOpen(false)}
+          onClose={() => {
+            setBackendSettingsOpen(false);
+            if (desktopCommandComposer && !isTouchInput) {
+              requestTerminalFocus();
+            }
+          }}
         />
       ) : null}
 
@@ -6012,19 +6183,26 @@ function hasOpenModal() {
 }
 
 function SplitGrid({
+  bridgeId,
   cells,
   selectedPaneId,
   onSelectPane,
   refitToken,
   focusToken,
   touchInput,
+  desktopCommandComposer,
+  desktopCommandEnterNewline,
+  terminalCursorBlink,
   terminalFontSizePx,
+  terminalScreenReaderText,
+  autoRenameUploadConflicts,
   mobileControlsScalePercent,
   mobileTapTarget,
   mobileLongPressBehavior,
   mobileTouchSelectionEndpointTimeoutMs,
   mobileCommandExpandingInput,
   mobileCommandEnterNewline,
+  mobileCommandFocusAfterSubmit,
   terminalInputTransport,
   terminalInputBatchDelayMs,
   terminalOutputCoalesceMs,
@@ -6033,19 +6211,26 @@ function SplitGrid({
   httpUrl,
   wsUrl,
 }: {
+  bridgeId: string;
   cells: { pane: PaneInfo; style: CSSProperties }[];
   selectedPaneId: string | null;
   onSelectPane: (pane: PaneInfo) => void;
   refitToken: number;
   focusToken: number;
   touchInput: boolean;
+  desktopCommandComposer: boolean;
+  desktopCommandEnterNewline: boolean;
+  terminalCursorBlink: boolean;
   terminalFontSizePx: number;
+  terminalScreenReaderText: boolean;
+  autoRenameUploadConflicts: boolean;
   mobileControlsScalePercent: number;
   mobileTapTarget: MobileTerminalTapTarget;
   mobileLongPressBehavior: MobileLongPressBehavior;
   mobileTouchSelectionEndpointTimeoutMs: MobileTouchSelectionEndpointTimeoutMs;
   mobileCommandExpandingInput: boolean;
   mobileCommandEnterNewline: boolean;
+  mobileCommandFocusAfterSubmit: boolean;
   terminalInputTransport: TerminalInputTransport;
   terminalInputBatchDelayMs: number;
   terminalOutputCoalesceMs: number;
@@ -6056,8 +6241,9 @@ function SplitGrid({
 }) {
   return (
     <div className="pane-grid" aria-label="Split panes">
-      {cells.map(({ pane, style }) => {
+      {cells.map(({ pane, style }, index) => {
         const selected = pane.pane_id === selectedPaneId;
+        const accessibilityLabel = `Pane ${index + 1} of ${cells.length} terminal: ${paneTitle(pane)}`;
         return (
           <div
             key={pane.pane_id}
@@ -6067,6 +6253,7 @@ function SplitGrid({
             onPointerDown={() => onSelectPane(pane)}
           >
             <TerminalView
+              bridgeId={bridgeId}
               pane={pane}
               connectionKey={connectionKey}
               resumeToken={resumeToken}
@@ -6075,18 +6262,26 @@ function SplitGrid({
               autoFocus={selected && !touchInput}
               scrollSensitivity={touchInput ? 2 : 0.4}
               mobileControls={selected && touchInput}
+              desktopCommandComposer={selected && !touchInput && desktopCommandComposer}
+              desktopCommandEnterNewline={desktopCommandEnterNewline}
+              cursorBlink={!touchInput && terminalCursorBlink}
               terminalFontSizePx={terminalFontSizePx}
+              terminalScreenReaderText={terminalScreenReaderText}
+              autoRenameUploadConflicts={autoRenameUploadConflicts}
               mobileControlsScalePercent={mobileControlsScalePercent}
               mobileTapTarget={mobileTapTarget}
               mobileLongPressBehavior={mobileLongPressBehavior}
               mobileTouchSelectionEndpointTimeoutMs={mobileTouchSelectionEndpointTimeoutMs}
               mobileCommandExpandingInput={mobileCommandExpandingInput}
               mobileCommandEnterNewline={mobileCommandEnterNewline}
+              mobileCommandFocusAfterSubmit={mobileCommandFocusAfterSubmit}
               terminalInputTransport={terminalInputTransport}
               terminalInputBatchDelayMs={terminalInputBatchDelayMs}
               terminalOutputCoalesceMs={terminalOutputCoalesceMs}
               refitToken={selected ? refitToken : 0}
               focusToken={selected ? focusToken : 0}
+              accessibilityLabel={accessibilityLabel}
+              selected={selected}
             />
           </div>
         );
@@ -6144,7 +6339,17 @@ function TabBar({
               onClick={() => onSelectTab(tab.tab_id)}
               onContextMenu={(event) => {
                 event.preventDefault();
+                focusOverlayTrigger(event.currentTarget);
                 onMenu("tab", tab.tab_id, label, event.clientX, event.clientY, canClearTabName(tab));
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) {
+                  return;
+                }
+                event.preventDefault();
+                focusOverlayTrigger(event.currentTarget);
+                const rect = event.currentTarget.getBoundingClientRect();
+                onMenu("tab", tab.tab_id, label, rect.left, rect.bottom, canClearTabName(tab));
               }}
             >
               <span className="dot" data-status={tab.agent_status} />
@@ -6158,7 +6363,10 @@ function TabBar({
         type="button"
         aria-label="New tab"
         title="New tab"
-        onClick={() => onCreateTab(activeSpace.workspace_id)}
+        onClick={(event) => {
+          focusOverlayTrigger(event.currentTarget);
+          onCreateTab(activeSpace.workspace_id);
+        }}
       >
         <Plus size={14} />
       </button>
@@ -7345,7 +7553,10 @@ function Switcher({
           aria-label="Settings"
           title={`Settings; bridge: ${bridgeLabel}`}
           data-spin={capabilityState === "probing" ? "" : undefined}
-          onClick={onBackendSettings}
+          onClick={(event) => {
+            focusOverlayTrigger(event.currentTarget);
+            onBackendSettings();
+          }}
         >
           <Settings size={16} />
         </button>
@@ -7355,7 +7566,10 @@ function Switcher({
           aria-label="Refresh"
           title="Refresh"
           data-spin={loadState === "loading" ? "" : undefined}
-          onClick={onRefresh}
+          onClick={(event) => {
+            focusOverlayTrigger(event.currentTarget);
+            onRefresh();
+          }}
         >
           <RefreshCw size={16} />
         </button>
@@ -7461,7 +7675,14 @@ function Switcher({
                   : ""}
             </span>
             {bridgeBlocked ? (
-              <button type="button" className="btn" onClick={onBackendSettings}>
+              <button
+                type="button"
+                className="btn"
+                onClick={(event) => {
+                  focusOverlayTrigger(event.currentTarget);
+                  onBackendSettings();
+                }}
+              >
                 Settings
               </button>
             ) : null}
@@ -7495,6 +7716,7 @@ function Switcher({
                     aria-haspopup="dialog"
                     aria-expanded={spaceOptionsMenu ? "true" : "false"}
                     onClick={(event) => {
+                      focusOverlayTrigger(event.currentTarget);
                       const rect = event.currentTarget.getBoundingClientRect();
                       setOptionsMenu(null);
                       setSpaceOptionsMenu({ x: rect.right, y: rect.bottom + 4 });
@@ -7575,11 +7797,12 @@ function Switcher({
                     type="button"
                     aria-label="New tab"
                     title="New tab"
-                    onClick={() =>
-                      selectedBridgeId && activeSpace
-                        ? onCreateTab(selectedBridgeId, activeSpace.workspace_id)
-                        : undefined
-                    }
+                    onClick={(event) => {
+                      focusOverlayTrigger(event.currentTarget);
+                      if (selectedBridgeId && activeSpace) {
+                        onCreateTab(selectedBridgeId, activeSpace.workspace_id);
+                      }
+                    }}
                   >
                     <Plus size={14} />
                   </button>
@@ -7597,7 +7820,7 @@ function Switcher({
                 ) : null}
                 {showPinnedOnlyControl ? (
                   <button
-                    className="sec-add sec-add-pin"
+                    className="sec-add"
                     type="button"
                     aria-label={`Show ${pinnedOnlyLabel} only`}
                     title="Pinned only"
@@ -7610,7 +7833,7 @@ function Switcher({
                 ) : null}
                 {showActiveOnlyControl ? (
                   <button
-                    className="sec-add sec-add-active"
+                    className="sec-add"
                     type="button"
                     aria-label={`Show active ${sidebarView === "tabs" ? "agents" : "statuses"} only`}
                     title={sidebarView === "tabs" ? "Active agents only" : "Active statuses only"}
@@ -7649,6 +7872,7 @@ function Switcher({
                     aria-haspopup="dialog"
                     aria-expanded={optionsMenu ? "true" : "false"}
                     onClick={(event) => {
+                      focusOverlayTrigger(event.currentTarget);
                       const rect = event.currentTarget.getBoundingClientRect();
                       setSpaceOptionsMenu(null);
                       setOptionsMenu({ x: rect.right, y: rect.bottom + 4 });
@@ -7848,6 +8072,7 @@ function OptionsMenuShell({
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  useFocusReturn();
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -7865,8 +8090,14 @@ function OptionsMenuShell({
       top = window.innerHeight - margin - rect.height;
     }
     setPos({ left, top: Math.max(margin, top) });
-    el.focus();
   }, [x, y]);
+
+  useLayoutEffect(() => {
+    if (!pos || !ref.current) {
+      return;
+    }
+    (focusableElements(ref.current)[0] ?? ref.current).focus();
+  }, [pos]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -7890,6 +8121,7 @@ function OptionsMenuShell({
       <button
         className="overlay-scrim overlay-scrim-clear"
         type="button"
+        tabIndex={-1}
         aria-label="Close list options"
         onClick={onClose}
       />
@@ -7899,6 +8131,7 @@ function OptionsMenuShell({
         role="dialog"
         aria-label={ariaLabel}
         tabIndex={-1}
+        onKeyDown={trapFocusWithin}
         style={{
           left: pos?.left ?? x,
           top: pos?.top ?? y,
@@ -7928,6 +8161,7 @@ export function QuickPaneNoteDialog({
   const dialogRef = useRef<HTMLFormElement | null>(null);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
   const bodyInputRef = useRef<HTMLTextAreaElement | null>(null);
+  useFocusReturn();
 
   useEffect(() => {
     titleInputRef.current?.focus();
@@ -7963,39 +8197,12 @@ export function QuickPaneNoteDialog({
     }
     onSubmit(trimmedTitle, bodyExpanded ? body : "");
   };
-  const trapDialogFocus = (event: ReactKeyboardEvent<HTMLFormElement>) => {
-    if (event.key !== "Tab") {
-      return;
-    }
-    const dialog = dialogRef.current;
-    if (!dialog) {
-      return;
-    }
-    const focusable = Array.from(
-      dialog.querySelectorAll<HTMLElement>(
-        "button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex='-1'])",
-      ),
-    );
-    if (focusable.length === 0) {
-      return;
-    }
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    const active = document.activeElement;
-    if (event.shiftKey && active === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && active === last) {
-      event.preventDefault();
-      first.focus();
-    }
-  };
-
   return (
     <div className="overlay-root">
       <button
         className="overlay-scrim"
         type="button"
+        tabIndex={-1}
         aria-label="Cancel"
         disabled={busy}
         onClick={cancel}
@@ -8013,7 +8220,7 @@ export function QuickPaneNoteDialog({
             cancel();
             return;
           }
-          trapDialogFocus(event);
+          trapFocusWithin(event);
         }}
       >
         <div className="modal-title">Add note</div>
@@ -8811,7 +9018,10 @@ export function NoteEditor({
               type="button"
               aria-label="Delete note"
               title="Delete"
-              onClick={() => onDelete(entry)}
+              onClick={(event) => {
+                focusOverlayTrigger(event.currentTarget);
+                onDelete(entry);
+              }}
             >
               <Trash2 size={16} />
             </button>
@@ -9286,10 +9496,6 @@ function sortAgentPanes(panes: PaneInfo[], sort: AgentSort, snapshot: Snapshot) 
 
   return [...panes].sort((a, b) => {
     if (sort === "attention") {
-      const attention = Number(isAttention(b.agent_status)) - Number(isAttention(a.agent_status));
-      if (attention !== 0) {
-        return attention;
-      }
       const status = AGENT_ATTENTION_ORDER[a.agent_status] - AGENT_ATTENTION_ORDER[b.agent_status];
       if (status !== 0) {
         return status;
@@ -9320,15 +9526,14 @@ function sortAgentPanes(panes: PaneInfo[], sort: AgentSort, snapshot: Snapshot) 
 export function sortScopedAgentPanes(entries: ScopedAgentPane[], sort: AgentSort) {
   return [...entries].sort((a, b) => {
     if (sort === "attention") {
-      const attention =
-        Number(isAttention(b.pane.agent_status)) - Number(isAttention(a.pane.agent_status));
-      if (attention !== 0) {
-        return attention;
-      }
       const status =
         AGENT_ATTENTION_ORDER[a.pane.agent_status] - AGENT_ATTENTION_ORDER[b.pane.agent_status];
       if (status !== 0) {
         return status;
+      }
+      const activity = compareLastStatusTransition(a, b);
+      if (activity !== 0) {
+        return activity;
       }
     } else if (sort === "status") {
       const status =
@@ -9601,7 +9806,14 @@ export function menuItems(
   return paneItems;
 }
 
-function closeCopy(kind: MenuKind) {
+export function closeCopy(kind: MenuKind, linkedLabels: readonly string[] = []) {
+  if (kind === "space" && linkedLabels.length > 0) {
+    return {
+      title: "Close workspace group?",
+      message: `This closes this space and all linked worktree spaces (${linkedLabels.join(", ")}), including every tab and pane in the group.`,
+      confirm: "Close entire group",
+    };
+  }
   switch (kind) {
     case "space":
       return {

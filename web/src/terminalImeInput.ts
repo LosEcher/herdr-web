@@ -1,10 +1,46 @@
 /**
- * Helpers for browser IME (especially CJK) on the ghostty terminal textarea.
+ * Browser IME helpers for the terminal's hidden textarea.
  *
- * Composition must not stream intermediate preedit (pinyin, etc.) into the PTY.
- * Only the final committed text after compositionend (or non-composition insertText)
- * should become terminal input.
+ * Composition preedit stays in the textarea. Only a completed composition or
+ * ordinary, non-composition input is allowed to reach the PTY.
  */
+
+export type TerminalImeState =
+  | {
+      phase: "idle";
+      preedit: "";
+      pendingInput:
+        | { kind: "commit"; text: string }
+        | { kind: "cancellation"; remaining: string }
+        | null;
+    }
+  | {
+      phase: "composing";
+      baseline: string;
+      preedit: string;
+      pendingInput: null;
+    };
+
+export type TerminalImeEvent =
+  | { type: "compositionstart"; data: string; textareaValue: string }
+  | { type: "compositionupdate"; data: string; textareaValue: string }
+  | { type: "compositionend"; data: string; textareaValue: string }
+  | {
+      type: "input";
+      data: string | null;
+      inputType: string;
+      isComposing: boolean;
+      textareaValue: string;
+    }
+  | { type: "settle" }
+  | { type: "reset" };
+
+export type TerminalImeTransition = {
+  state: TerminalImeState;
+  output: string | null;
+  suppressInput: boolean;
+  clearTextarea: boolean;
+};
 
 export type ImeTextareaAnchor = {
   left: number;
@@ -14,24 +50,154 @@ export type ImeTextareaAnchor = {
   fontSizePx: number;
 };
 
-/** True while an IME composition is active (keydown / input paths). */
+export function idleTerminalImeState(): TerminalImeState {
+  return { phase: "idle", preedit: "", pendingInput: null };
+}
+
+/**
+ * Reduce browser composition/input events into terminal output.
+ *
+ * Browsers disagree about whether their final input event occurs before or
+ * after compositionend. A completed composition is emitted at compositionend;
+ * pendingInput suppresses a matching trailing commit or canceled-preedit
+ * replay without swallowing unrelated input. Call settle after the trailing
+ * composition edit window; canceled composition may need to remain armed until
+ * the next keydown because some browsers replay canceled preedit after a
+ * microtask.
+ */
+export function reduceTerminalImeState(
+  state: TerminalImeState,
+  event: TerminalImeEvent,
+): TerminalImeTransition {
+  switch (event.type) {
+    case "compositionstart":
+      return transition({
+        phase: "composing",
+        baseline: event.textareaValue,
+        preedit: event.data,
+        pendingInput: null,
+      });
+
+    case "compositionupdate":
+      if (state.phase !== "composing") {
+        return transition(state);
+      }
+      return transition({ ...state, preedit: event.data });
+
+    case "compositionend": {
+      if (state.phase !== "composing") {
+        return transition(state, { suppressInput: true });
+      }
+      const output = normalizeTerminalText(event.data);
+      const canceledPreedit =
+        output === null
+          ? normalizeTerminalText(state.preedit) ??
+            normalizeTerminalText(textareaSuffix(state.baseline, event.textareaValue))
+          : null;
+      return transition(
+        {
+          phase: "idle",
+          preedit: "",
+          pendingInput: output
+            ? { kind: "commit", text: output }
+            : canceledPreedit
+              ? { kind: "cancellation", remaining: canceledPreedit }
+              : null,
+        },
+        {
+          output,
+          suppressInput: true,
+          clearTextarea: true,
+        },
+      );
+    }
+
+    case "input": {
+      if (state.phase === "composing") {
+        const preedit = inputPreedit(state.baseline, event);
+        return transition({ ...state, preedit }, { suppressInput: true });
+      }
+
+      if (event.isComposing || isImeCompositionInputType(event.inputType)) {
+        return transition(
+          { ...state, pendingInput: null },
+          { suppressInput: true, clearTextarea: true },
+        );
+      }
+
+      if (state.pendingInput !== null) {
+        const candidate = inputCandidate(event.data, event.textareaValue);
+        if (state.pendingInput.kind === "commit" && candidate === state.pendingInput.text) {
+          return transition(
+            { ...state, pendingInput: null },
+            { suppressInput: true, clearTextarea: true },
+          );
+        }
+        if (
+          state.pendingInput.kind === "cancellation" &&
+          event.inputType === "insertText" &&
+          candidate !== "" &&
+          state.pendingInput.remaining.startsWith(candidate)
+        ) {
+          const remaining = state.pendingInput.remaining.slice(candidate.length);
+          return transition(
+            {
+              ...state,
+              pendingInput: remaining ? { kind: "cancellation", remaining } : null,
+            },
+            { suppressInput: true, clearTextarea: true },
+          );
+        }
+        return transition({ ...state, pendingInput: null });
+      }
+
+      return transition(state);
+    }
+
+    case "settle":
+      return state.phase === "idle"
+        ? transition({ ...state, pendingInput: null })
+        : transition(state);
+
+    case "reset":
+      return transition(idleTerminalImeState(), {
+        suppressInput: state.phase === "composing",
+        clearTextarea: state.phase === "composing",
+      });
+  }
+}
+
+/**
+ * Return true when beforeinput belongs to composition and must be left in the
+ * textarea instead of being sent directly to the PTY.
+ */
+export function shouldDeferBeforeInputToIme(
+  state: TerminalImeState,
+  event: Pick<InputEvent, "data" | "inputType" | "isComposing">,
+): boolean {
+  if (state.phase === "composing" || event.isComposing || isImeCompositionInputType(event.inputType)) {
+    return true;
+  }
+  if (state.pendingInput === null) {
+    return false;
+  }
+  const candidate = normalizeTerminalText(event.data);
+  if (state.pendingInput.kind === "commit") {
+    return candidate === state.pendingInput.text;
+  }
+  return (
+    event.inputType === "insertText" &&
+    candidate !== null &&
+    state.pendingInput.remaining.startsWith(candidate)
+  );
+}
+
 export function isImeComposingKeyEvent(
   event: Pick<KeyboardEvent, "isComposing" | "keyCode">,
 ): boolean {
   return event.isComposing || event.keyCode === 229;
 }
 
-/** True for InputEvent / beforeinput while composition is in progress. */
-export function isImeComposingInputEvent(
-  event: Pick<InputEvent, "isComposing" | "inputType">,
-): boolean {
-  if (event.isComposing) {
-    return true;
-  }
-  return isImeCompositionInputType(event.inputType);
-}
-
-/** Input types that belong to IME preedit, not final terminal bytes. */
 export function isImeCompositionInputType(inputType: string): boolean {
   return (
     inputType === "insertCompositionText" ||
@@ -41,81 +207,11 @@ export function isImeCompositionInputType(inputType: string): boolean {
   );
 }
 
-/**
- * Whether beforeinput should send bytes to the terminal immediately.
- * Composition preedit must pass through the textarea so the OS IME can work.
- */
-export function shouldHandleBeforeInputForTerminal(
-  event: Pick<InputEvent, "isComposing" | "inputType" | "data">,
-): boolean {
-  if (isImeComposingInputEvent(event)) {
-    return false;
-  }
-  return beforeInputOutput(event) !== null;
-}
-
-/**
- * Whether a generic input event may flush textarea deltas to the terminal.
- * While composing, intermediate values stay local until compositionend.
- */
-export function shouldSendTextareaDeltaOnInput(isComposing: boolean): boolean {
-  return !isComposing;
-}
-
-/**
- * Final committed text for a completed composition.
- * Prefer CompositionEvent.data when present; otherwise diff against the pre-composition baseline.
- */
-export function compositionCommittedOutput(
-  baseline: string,
-  textareaValue: string,
-  compositionData: string | null | undefined,
-): string | null {
-  if (typeof compositionData === "string" && compositionData.length > 0) {
-    return compositionData.replace(/\n/g, "\r");
-  }
-  const delta = textareaDelta(baseline, textareaValue);
-  return delta.length > 0 ? delta : null;
-}
-
-/**
- * In-progress IME preedit (pinyin / partial CJK) for on-screen preview.
- * Prefer CompositionEvent.data; fall back to the textarea suffix after the baseline.
- */
-export function compositionPreeditText(
-  baseline: string,
-  textareaValue: string,
-  compositionData: string | null | undefined,
-): string {
-  // Empty string from CompositionEvent means "no data this event", not "clear preedit".
-  if (typeof compositionData === "string" && compositionData.length > 0) {
-    return compositionData;
-  }
-  if (textareaValue.startsWith(baseline)) {
-    return textareaValue.slice(baseline.length);
-  }
-  return textareaValue;
-}
-
-/** Grow the invisible IME hit target with preedit length so candidate windows stay near the caret. */
-export function imeTextareaSizeForPreedit(
-  cellWidth: number,
-  cellHeight: number,
-  preeditLength: number,
-): { width: number; height: number } {
-  const cells = Math.max(1, preeditLength > 0 ? preeditLength : 1);
-  return {
-    width: Math.max(2, Math.ceil(cellWidth) * cells),
-    height: Math.max(2, Math.ceil(cellHeight)),
-  };
-}
-
 export function beforeInputOutput(event: Pick<InputEvent, "inputType" | "data">): string | null {
   switch (event.inputType) {
     case "insertText":
     case "insertReplacementText":
-    case "insertFromPaste":
-      return event.data ? event.data.replace(/\n/g, "\r") : null;
+      return normalizeTerminalText(event.data);
     case "insertLineBreak":
     case "insertParagraph":
       return "\r";
@@ -170,15 +266,14 @@ export function keyboardEventOutput(
   }
 }
 
-/**
- * Compute a fixed-position rect for the hidden textarea so the OS IME candidate
- * window anchors near the terminal caret instead of off-screen.
- */
+/** Position the hidden textarea over the visible terminal cursor cell. */
 export function imeTextareaAnchor(options: {
-  viewportLeft: number;
-  viewportTop: number;
-  viewportWidth: number;
-  viewportHeight: number;
+  terminalLeft: number;
+  terminalTop: number;
+  terminalWidth: number;
+  terminalHeight: number;
+  browserWidth: number;
+  browserHeight: number;
   cellWidth: number;
   cellHeight: number;
   cursorCol: number;
@@ -187,17 +282,60 @@ export function imeTextareaAnchor(options: {
 }): ImeTextareaAnchor {
   const cellWidth = Math.max(1, options.cellWidth);
   const cellHeight = Math.max(1, options.cellHeight);
-  const maxCol = Math.max(0, Math.floor(options.viewportWidth / cellWidth) - 1);
-  const maxRow = Math.max(0, Math.floor(options.viewportHeight / cellHeight) - 1);
+  const maxCol = Math.max(0, Math.floor(options.terminalWidth / cellWidth) - 1);
+  const maxRow = Math.max(0, Math.floor(options.terminalHeight / cellHeight) - 1);
   const col = clampInteger(options.cursorCol, 0, maxCol);
   const row = clampInteger(options.cursorRow, 0, maxRow);
+  const maxLeft = Math.max(1, options.browserWidth - cellWidth - 1);
+  const maxTop = Math.max(1, options.browserHeight - cellHeight - 1);
   return {
-    left: options.viewportLeft + col * cellWidth,
-    top: options.viewportTop + row * cellHeight,
+    left: clampNumber(options.terminalLeft + col * cellWidth, 1, maxLeft),
+    top: clampNumber(options.terminalTop + row * cellHeight, 1, maxTop),
     width: cellWidth,
     height: cellHeight,
     fontSizePx: Math.max(1, options.fontSizePx),
   };
+}
+
+function transition(
+  state: TerminalImeState,
+  overrides: Partial<Omit<TerminalImeTransition, "state">> = {},
+): TerminalImeTransition {
+  return {
+    state,
+    output: null,
+    suppressInput: false,
+    clearTextarea: false,
+    ...overrides,
+  };
+}
+
+function inputPreedit(
+  baseline: string,
+  event: Extract<TerminalImeEvent, { type: "input" }>,
+) {
+  if (typeof event.data === "string") {
+    return event.data;
+  }
+  if (event.textareaValue.startsWith(baseline)) {
+    return event.textareaValue.slice(baseline.length);
+  }
+  return event.textareaValue;
+}
+
+function textareaSuffix(baseline: string, value: string) {
+  return value.startsWith(baseline) ? value.slice(baseline.length) : value;
+}
+
+function inputCandidate(data: string | null, textareaValue: string) {
+  return normalizeTerminalText(data) ?? normalizeTerminalText(textareaValue) ?? "";
+}
+
+function normalizeTerminalText(value: string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+  return value.replace(/\n/g, "\r");
 }
 
 function clampInteger(value: number, min: number, max: number) {
@@ -205,4 +343,11 @@ function clampInteger(value: number, min: number, max: number) {
     return min;
   }
   return Math.min(max, Math.max(min, Math.trunc(value)));
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+  return Math.min(max, Math.max(min, value));
 }
